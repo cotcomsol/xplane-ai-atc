@@ -80,6 +80,7 @@ class Session:
     async def prepare_voice(self) -> None:
         """Download/load the local voice up front so the first transmission doesn't wait for it."""
         if self.local:
+            log.info("Loading the local voice...")
             try:
                 await asyncio.to_thread(self.local.load)
             except Exception as e:  # noqa: BLE001
@@ -501,6 +502,9 @@ def main() -> None:
     sp.add_argument("--out", help="also write the reply audio to this WAV file")
     sp.add_argument("--show-situation", action="store_true")
     args = p.parse_args()
+    import faulthandler
+
+    faulthandler.enable()  # a crash inside native code (onnxruntime, PortAudio) prints a traceback instead of vanishing
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
