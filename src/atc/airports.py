@@ -159,6 +159,12 @@ def apt_dat_files(xplane_path: str) -> list[Path]:
 class AirportDB:
     def __init__(self, airports: list[dict]):
         self.airports = [a for a in airports if a["type"] != "heli"]
+        self._by_id: dict[str, dict] | None = None
+
+    def by_id(self, ident: str) -> dict | None:
+        if self._by_id is None:
+            self._by_id = {a["id"]: a for a in self.airports}
+        return self._by_id.get(ident.upper())
 
     @classmethod
     def load(cls, xplane_path: str, cache_dir: Path) -> "AirportDB | None":

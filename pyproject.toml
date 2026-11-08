@@ -1,6 +1,6 @@
 [project]
 name = "atc"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI air traffic control companion for X-Plane 12"
 requires-python = ">=3.11"
 license = "GPL-3.0-or-later"

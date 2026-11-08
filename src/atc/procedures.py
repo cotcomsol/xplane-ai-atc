@@ -69,10 +69,27 @@ class Threshold:
 
 
 @dataclass
+class Sid:
+    ident: str  # ALMDN4
+    runways: set[str] = field(default_factory=set)  # CIFP runway transitions: "12B" (both 12L/R), "30L"
+    transitions: set[str] = field(default_factory=set)  # enroute transitions: HRNER, MOGEE
+    vector: bool = False  # radar vector SID
+
+    def serves(self, runway: str) -> bool:
+        """Can a departure from this runway fly the SID? (no runway transitions = any runway)"""
+        if not self.runways:
+            return True
+        num = runway[:2]
+        return any(r == runway or r == num or (r[:2] == num and r[2:] == "B") or r == "ALL"
+                   for r in self.runways)
+
+
+@dataclass
 class Procedures:
     airport: str
     thresholds: dict[str, Threshold]
     approaches: dict[str, Approach]
+    sids: dict[str, Sid] = field(default_factory=dict)
 
     def for_runway(self, runway: str) -> list[Approach]:
         order = {"ILS": 0, "LOC": 1, "RNAV (GPS)": 2, "RNAV (RNP)": 3, "GPS": 4}
@@ -113,8 +130,21 @@ def find_cifp(xplane_path: str, airport_id: str, extra_dirs: list[str] | None = 
 def parse_cifp(path: Path) -> Procedures:
     thresholds: dict[str, Threshold] = {}
     approaches: dict[str, Approach] = {}
+    sids: dict[str, Sid] = {}
     for line in path.read_text(encoding="latin-1").splitlines():
-        if line.startswith("RWY:"):
+        if line.startswith("SID:"):
+            f = [x.strip() for x in line[4:].rstrip(";").split(",")]
+            if len(f) < 4 or not f[2]:
+                continue
+            sid = sids.setdefault(f[2], Sid(f[2]))
+            rtype, trans = f[1], f[3]
+            if rtype in ("T", "V"):
+                sid.vector = True
+            if trans.startswith("RW"):
+                sid.runways.add(trans[2:])
+            elif trans and trans != "ALL" and rtype in ("3", "6", "S", "V"):
+                sid.transitions.add(trans)
+        elif line.startswith("RWY:"):
             head, _, coords = line[4:].partition(";")
             f = [x.strip() for x in head.split(",")]
             c = [x.strip() for x in coords.split(",")]
@@ -161,7 +191,7 @@ def parse_cifp(path: Path) -> Procedures:
     for ap in approaches.values():
         if ap.course_mag is None and ap.runway[:2].isdigit():
             ap.course_mag = float(int(ap.runway[:2]) * 10)  # fallback: runway number
-    return Procedures(path.stem, thresholds, approaches)
+    return Procedures(path.stem, thresholds, approaches, sids)
 
 
 _cache: dict[str, Procedures | None] = {}

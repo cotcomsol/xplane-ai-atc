@@ -16,6 +16,7 @@ class Config:
     ptt_command: str = "sim/operation/contact_atc"
 
     callsign: str = ""
+    simbrief_user: str = ""  # SimBrief username or numeric user id: the filed flight plan
 
     api_key: str = ""
     stt_model: str = "openai/gpt-4o-mini-transcribe"
@@ -83,6 +84,7 @@ def load(path: str | Path = "atc.toml") -> Config:
     cfg.cifp_dirs = xp.get("cifp_dirs", cfg.cifp_dirs)
 
     cfg.callsign = data.get("pilot", {}).get("callsign", cfg.callsign)
+    cfg.simbrief_user = str(data.get("simbrief", {}).get("username", cfg.simbrief_user)).strip()
 
     orr = data.get("openrouter", {})
     cfg.api_key = orr.get("api_key", "")

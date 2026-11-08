@@ -28,6 +28,9 @@ locally on your CPU and costs nothing.
   established on the localizer, cleared ILS runway two eight right approach").
 - **IFR:** clearances ("cleared to Monterey airport via radar vectors, then as filed..."), readback
   checks, climbs, handoffs, "expect the ILS" and the approach.
+- **SimBrief flight plans:** set your SimBrief username and the clearance comes from the plan you filed
+  there: "cleared to San Carlos airport via the LOUPE one departure, HRNER transition, then as filed,
+  maintain three thousand, expect niner thousand...", with your filed cruise altitude and destination.
 - **Cross-country:** Center frequencies from FAA data, sector handoffs, radar service termination.
 - **ATIS** broadcasts built from the sim weather when you tune an ATIS frequency.
 - **Controller-initiated calls:** handoffs, vectors, landing clearances you forgot to ask for,
@@ -101,7 +104,10 @@ On Windows, `run-atc.bat` runs `atc run`; `run-atc.bat monitor` etc. run the oth
 Tips:
 
 - Say your callsign the way it's set in X-Plane (or set `[pilot] callsign` in `atc.toml`).
-- Say "VFR" or "IFR" and your destination on your first call ("VFR to Monterey", "IFR to Monterey,
+- With `[simbrief] username` set, just ask clearance delivery (or ground) for your clearance ("ready to
+  copy"); the latest plan you generated on SimBrief is fetched at startup and again when you call, so
+  re-filing there before you call is enough.
+- Without a SimBrief plan, say "VFR" or "IFR" and your destination on your first call ("VFR to Monterey", "IFR to Monterey,
   ready to copy") so the controllers know your plan.
 - Ask approach for an approach by name: "request the ILS runway two eight right".
 
@@ -121,6 +127,10 @@ Everything is in `atc.toml` (see `atc.example.toml` for all options and comments
   literally ("wind three zero zero", not "wind three hundred"): Kokoro, Gemini TTS and Grok TTS do;
   Microsoft MAI and ElevenLabs voices don't.
 - `[audio] voice_threads`: CPU threads for the local voice (lower it if X-Plane stutters while ATC talks).
+- `[simbrief] username`: your SimBrief username or numeric Pilot ID (simbrief.com Account Settings; not
+  your email). The plan is used when it departs from the airport you're at. Its departure procedure is
+  checked against X-Plane's CIFP data: one that doesn't serve the runway in use is amended to radar
+  vectors to the first fix on your route.
 - `[chatter] mode`: `always` (AI traffic, else made-up aircraft), `traffic` (AI traffic only) or `off`.
 - `[xplane] cifp_dirs`: extra folders with CIFP approach data (X-Plane's own `Custom Data/CIFP`, then
   `Resources/default data/CIFP`, are searched as well).
@@ -161,15 +171,18 @@ Data sources:
 - Class B/C airports: FAA airspace data (`src/atc/airspace.py`).
 - Center radio sites and frequencies: FAA NASR (`src/atc/data/centers.json`).
 - Traffic: X-Plane's TCAS targets (AI and multiplayer aircraft).
+- Filed flight plans: SimBrief's public flight plan fetcher (`src/atc/flightplan.py`); departure
+  procedures from X-Plane's CIFP files.
 
 Source layout: `xplane.py` (web API client), `state.py` (aircraft state), `airports.py`,
 `taxi.py`, `procedures.py` (CIFP approaches and vectoring), `pattern.py`, `traffic.py`,
-`controller.py` (facts, events, prompt), `atis.py`, `chatter.py`, `local_tts.py`, `audio.py`
+`flightplan.py` (SimBrief), `controller.py` (facts, events, prompt), `atis.py`, `chatter.py`, `local_tts.py`, `audio.py`
 (recording, playback, radio effect), `openrouter.py`, `debrief.py`, `main.py` (commands).
 
 ## Limitations
 
-- IFR routes are always "radar vectors, then as filed"; the app doesn't know your filed route.
+- Without a SimBrief plan, IFR routes are always "radar vectors, then as filed".
+- Filed arrival procedures (STARs) aren't used yet; arrivals get vectors to the approach.
 - No terrain or minimum vectoring altitudes: vectoring altitudes come from the approach procedure.
 - Center handoffs need to know your destination (say it on your first call).
 - Speech recognition mishears sometimes, especially callsigns; the controller will ask you to say

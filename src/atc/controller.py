@@ -12,7 +12,8 @@ from collections import deque
 
 from .airports import AirportDB, Facility, bearing, dist_nm
 from .airspace import CLASS_B, airspace_class
-from .phraseology import altimeter_phrase, callsign_forms, region_for, spoken_runway, spoken_wind
+from .flightplan import FlightPlan, spoken_procedure
+from .phraseology import NUMBERS, altimeter_phrase, callsign_forms, region_for, spoken_runway, spoken_wind
 from .state import AircraftState, fmt_freq
 from .procedures import describe as describe_procedures
 from .procedures import load as load_procedures
@@ -244,7 +245,10 @@ def ifr_cruise(field_elev: float, course_mag: float) -> int:
 
 
 def altitude_words(ft: int) -> str:
+    """'four thousand five hundred'; 18,000 ft and up as a flight level ('flight level three six zero')."""
     from .procedures import _alt_words
+    if ft >= 18000:
+        return "flight level " + " ".join(NUMBERS[c] for c in f"{int(round(ft / 100.0)):03d}")
     return _alt_words(ft)
 
 
@@ -374,7 +378,8 @@ class Controller:
         self._lap: dict = {}  # per-lap flags (extend downwind, go-around, chased clearance)
         self.requested_alt: int | None = None
         self.ifr_plan: dict | None = None  # clearance we're about to issue
-        self.ifr_clearance: dict | None = None  # clearance issued: {dest, initial, cruise}
+        self.ifr_clearance: dict | None = None  # clearance issued: {dest, initial, cruise, route, sid, fix}
+        self.flight_plan: FlightPlan | None = None  # filed plan (SimBrief)
         self._expect_prompted = False
         self.ifr_climb_given = False
         self.assigned_alt: int | None = None
@@ -415,6 +420,9 @@ class Controller:
             self.flight_rules = "IFR"
         elif re.search(r"\bvfr\b", transcript, re.I):
             self.flight_rules = "VFR"
+        elif fac and self._filed_for(fac.airport) and re.search(
+                r"\b(clearance|ready to copy|as filed)\b", transcript, re.I):
+            self.flight_rules = "IFR"  # asking for the clearance of the plan filed from this airport
         if fac and self.db:
             dest = find_destination(self.db, transcript, fac)
             if dest:
@@ -435,8 +443,21 @@ class Controller:
         if alt and re.search(r"\b(request|filed|cruise|cruising|at|altitude|to)\b", transcript, re.I):
             self.requested_alt = alt
 
+    def set_flight_plan(self, plan: FlightPlan | None) -> None:
+        self.flight_plan = plan
+
+    def _filed_for(self, a: dict | None) -> FlightPlan | None:
+        """The filed plan if it departs from this airport."""
+        p = self.flight_plan
+        return p if p and a and p.origin == a["id"] else None
+
     def situation(self, s: AircraftState, fac: Facility | None, callsign: str, transcript: str = "") -> str:
         self.observe(transcript, fac)
+        plan = self._filed_for(fac.airport) if fac and fac.kind != "CENTER" and s.on_ground else None
+        if plan and not self.ifr_clearance and (self.destination is None or self.flight_rules == "IFR"):
+            dest = self.db.by_id(plan.destination) if self.db else None
+            if dest:
+                self.destination = dest  # the filed destination, before the pilot says it
         magvar = s.magvar
         region = "FAA" if not fac or fac.kind == "CENTER" else region_for(fac.airport["id"])
         full, abbrev = callsign_forms(callsign, region, s.icao_type)
@@ -484,6 +505,14 @@ class Controller:
             aclass = airspace_class(a) if region == "FAA" else None
             if aclass and fac.kind in ("TOWER", "GROUND", "DELIVERY"):
                 lines.append(f"AIRSPACE: {a['id']} is Class {aclass}")
+            if plan and fac.kind in ("GROUND", "DELIVERY", "TOWER"):
+                from .flightplan import plan_age_text
+                age = plan_age_text(plan)
+                lines.append(f"FILED FLIGHT PLAN ({plan.source}{', ' + age if age else ''}): {plan.origin} to "
+                             f"{plan.destination}, route {plan.route or 'direct'}"
+                             + (f", cruise {plan.cruise_ft} ft" if plan.cruise_ft else "")
+                             + (f", aircraft {plan.aircraft}" if plan.aircraft else "")
+                             + ". Treat it as on file (IFR); don't ask the pilot for the route or destination.")
             if self.flight_rules == "IFR" and s.on_ground and fac.kind in ("GROUND", "DELIVERY", "TOWER"):
                 lines.append(self._ifr_departure(a, fac, s))
             elif aclass in ("B", "C") and s.on_ground and fac.kind in ("GROUND", "DELIVERY", "TOWER"):
@@ -586,9 +615,8 @@ class Controller:
             if fac.kind in RADAR_KINDS and self.ifr_clearance and not self.ifr_climb_given \
                     and not s.on_ground:
                 c = self.ifr_clearance
-                lines.append(f"IFR DEPARTURE checking in: after the radar contact call, say \"climb and maintain "
-                             f"{altitude_words(c['cruise'])}, cleared direct {short_name(c['dest'])}\" (no other "
-                             "frequencies).")
+                lines.append(f"IFR DEPARTURE checking in: after the radar contact call, say \"{self._climb_phrase(c)}\" "
+                             "(no other frequencies).")
             if fac.kind in RADAR_KINDS and self.destination:
                 dst = self.destination
                 dd = dist_nm(s.lat, s.lon, dst["lat"], dst["lon"])
@@ -689,10 +717,15 @@ class Controller:
         clr = self.ifr_clearance
         if clr:
             if fac.kind == "TOWER":
+                if clr.get("sid"):
+                    return (f"IFR DEPARTURE (clearance issued, flying the {spoken_procedure(clr['sid'])} departure): "
+                            "a normal takeoff clearance (callsign, wind, runway, \"cleared for takeoff\"), no heading "
+                            "- the departure procedure gives the route. Don't add a frequency; the handoff to "
+                            "departure comes after takeoff.")
                 return ("IFR DEPARTURE (clearance issued): the takeoff clearance must start with \"fly runway "
                         "heading\" (callsign, \"fly runway heading\", wind, runway, \"cleared for takeoff\"). Don't add "
                         "a frequency; the handoff to departure comes after takeoff.")
-            return (f"IFR clearance already issued: cleared to {short_name(clr['dest'])} via radar vectors then as filed, "
+            return (f"IFR clearance already issued: cleared to {short_name(clr['dest'])} via {clr['route']}, "
                     f"maintain {clr['initial']}, expect {clr['cruise']} ten minutes after departure, departure "
                     f"{dep_txt}, squawk {self.assigned_code}. If the pilot just read it back correctly, say only "
                     "\"<callsign>, readback correct\"" + (f" (and \"contact ground {fmt_freq(ground['khz'])} when "
@@ -701,18 +734,54 @@ class Controller:
         if fac.kind == "GROUND" and delivery:
             return (f"IFR: the pilot needs an IFR clearance from clearance delivery: \"contact clearance delivery "
                     f"{fmt_freq(delivery['khz'])} for your IFR clearance\" (unless they already have it).")
-        dest = self.destination
+        plan = self._filed_for(a)
+        dest = (self.db.by_id(plan.destination) if plan and self.db else None) or self.destination
         if not dest:
+            if plan:
+                return (f"IFR: the filed destination {plan.destination} isn't in the airport data; ask \"say "
+                        "destination\".")
             return "IFR: the pilot wants an IFR clearance but hasn't said the destination: ask \"say destination\"."
         crs = (bearing(a["lat"], a["lon"], dest["lat"], dest["lon"]) - s.magvar) % 360
-        cruise = self.requested_alt or ifr_cruise(a["elev"], crs)
+        cruise = (plan.cruise_ft if plan else None) or self.requested_alt or ifr_cruise(a["elev"], crs)
         initial = min(cruise, int(math.ceil((a["elev"] + 2500) / 1000.0) * 1000))
         code = self._next_code_cached()
-        self.ifr_plan = {"dest": dest, "initial": initial, "cruise": cruise}
+        route, sid, fix, note = self._clearance_route(a, s, plan)
+        self.ifr_plan = {"dest": dest, "initial": initial, "cruise": cruise, "route": route, "sid": sid, "fix": fix}
         return (f"IFR CLEARANCE to issue now (CRAFT), exactly: \"<callsign>, cleared to {short_name(dest)} airport via "
-                f"radar vectors, then as filed. Maintain {altitude_words(initial)}, expect {altitude_words(cruise)} "
+                f"{route}. Maintain {altitude_words(initial)}, expect {altitude_words(cruise)} "
                 f"one zero minutes after departure. Departure frequency {dep_txt}, squawk {code}.\" After a correct "
-                "readback say \"readback correct\".")
+                "readback say \"readback correct\"." + (f" {note}" if note else ""))
+
+    def _clearance_route(self, a: dict, s: AircraftState, plan: FlightPlan | None
+                         ) -> tuple[str, str, str, str]:
+        """(route words for the clearance, SID flown, first fix to go direct to, note for the controller)."""
+        if not plan:
+            return "radar vectors, then as filed", "", "", ""
+        fix = plan.sid_exit or plan.first_fix
+        vectors = f"radar vectors {fix}, then as filed" if fix else "radar vectors, then as filed"
+        if not plan.sid:
+            return vectors, "", fix, ""
+        procs = load_procedures(self.xplane_path, a["id"], self.cifp_dirs)
+        sid = procs.sids.get(plan.sid) if procs else None
+        rw = runway_in_use(a, s.wind_dir, s.wind_kt)
+        if procs and procs.sids and not sid:
+            return vectors, "", fix, (f"(The filed {plan.sid} departure isn't in the nav data, so the clearance "
+                                      "uses radar vectors instead; don't mention it unless the pilot asks.)")
+        if sid and rw and not sid.serves(rw[0]):
+            return vectors, "", fix, (f"(The filed {plan.sid} departure doesn't serve runway {rw[0]} in use, so the "
+                                      "route is amended to radar vectors; if the pilot asks, say it's for the "
+                                      "runway in use.)")
+        words = f"the {spoken_procedure(plan.sid)} departure"
+        if sid and plan.sid_exit in sid.transitions:
+            words += f", {plan.sid_exit} transition"
+        return words + ", then as filed", plan.sid, "", ""
+
+    def _climb_phrase(self, c: dict) -> str:
+        """What departure says to an IFR departure once identified: the climb, and the route if needed."""
+        climb = f"climb and maintain {altitude_words(c['cruise'])}"
+        if c.get("sid"):
+            return climb  # already on the departure procedure
+        return f"{climb}, cleared direct {c.get('fix') or short_name(c['dest'])}"
 
     def _departure_flow(self, a: dict, fac: Facility, aclass: str) -> str:
         dep = departure_freq(a)
@@ -1150,8 +1219,7 @@ class Controller:
             if self.ifr_clearance and not s.on_ground and not self.ifr_climb_given:
                 c = self.ifr_clearance
                 return ("The IFR departure's transponder now shows its code. Say: callsign, \"radar contact\" with "
-                        f"position, then \"climb and maintain {altitude_words(c['cruise'])}, cleared direct "
-                        f"{short_name(c['dest'])}\".")
+                        f"position, then \"{self._climb_phrase(c)}\".")
             return ("The aircraft's transponder now shows the code you assigned. Call radar contact with the "
                     "aircraft's position relative to the nearest airport, and give the altimeter.")
         ev = self._arrival_event(s, fac)
@@ -1162,8 +1230,7 @@ class Controller:
                 and not s.on_ground and not self._lap.get("climb_prompted") and not self.awaiting_ack:
             self._lap["climb_prompted"] = True
             c = self.ifr_clearance
-            return (f"Give the IFR departure its climb and route: \"<callsign>, climb and maintain "
-                    f"{altitude_words(c['cruise'])}, cleared direct {short_name(c['dest'])}\".")
+            return f"Give the IFR departure its climb and route: \"<callsign>, {self._climb_phrase(c)}\"."
         # Traffic advisories: radar controllers for identified aircraft, tower near its airport
         if not s.on_ground and s.traffic and (
                 (fac.kind in RADAR_KINDS and self._radar_identified(s)) or

@@ -14,6 +14,13 @@ ptt_command = "sim/operation/contact_atc"
 # Leave empty to use the aircraft tail number from X-Plane.
 callsign = ""
 
+[simbrief]
+# Your SimBrief username (or numeric user id, from simbrief.com Account Settings). The latest flight
+# plan you generated there is used for IFR clearances: destination, departure procedure, first fix and
+# cruise altitude. It is fetched at startup and again when you call ground or clearance delivery.
+# Leave empty to say your destination on the radio instead.
+username = ""
+
 [openrouter]
 api_key = ""
 stt_model = "openai/gpt-4o-mini-transcribe"

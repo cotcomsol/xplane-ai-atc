@@ -69,6 +69,7 @@ class Session:
         self._lock = asyncio.Lock()
         self.log = None  # FlightLog when recording a session
         self.local = None  # LocalVoice when the voice is generated on this computer
+        self._plan_checked = 0.0  # monotonic time of the last SimBrief fetch
         if cfg.voice_engine == "local":
             from .local_tts import LocalVoice
 
@@ -86,6 +87,26 @@ class Session:
             except Exception as e:  # noqa: BLE001
                 log.warning("Local voice failed to load (%s); using OpenRouter %s", e, self.cfg.tts_model)
                 self.local = None
+
+    async def refresh_flight_plan(self) -> None:
+        """Fetch the latest SimBrief plan (keeps the previous one if the fetch fails)."""
+        if not self.cfg.simbrief_user:
+            return
+        from .flightplan import fetch_simbrief
+
+        self._plan_checked = time.monotonic()
+        try:
+            plan = await fetch_simbrief(self.cfg.simbrief_user, timeout=4)
+        except Exception as e:  # noqa: BLE001 - a missing plan must never stop the radio
+            log.warning("SimBrief flight plan not loaded: %s", e)
+            return
+        old = self.ctl.flight_plan
+        if old and old.as_dict() == plan.as_dict():
+            return
+        self.ctl.set_flight_plan(plan)
+        log.info("Filed flight plan (SimBrief): %s", plan.summary)
+        if self.log:
+            self.log.write("flight_plan", source=plan.source, summary=plan.summary, plan=plan.as_dict())
 
     @property
     def player(self):
@@ -129,6 +150,9 @@ class Session:
                 if self.log and not event:
                     self.log.write("no_facility", khz=s.tx_khz, reason=what, state=snapshot(s))
                 return None
+            if (self.cfg.simbrief_user and not event and s.on_ground and fac.kind in ("DELIVERY", "GROUND")
+                    and not self.ctl.ifr_clearance and time.monotonic() - self._plan_checked > 60):
+                await self.refresh_flight_plan()  # pick up a plan re-filed since startup
             callsign = self.cfg.callsign or s.tailnum
             situation = self.ctl.situation(s, fac, callsign, "" if event else transcript)
             log.debug("SITUATION:\n%s", situation)
@@ -289,6 +313,7 @@ async def cmd_run(cfg) -> None:
     await sess.prepare_voice()
     sess.log = FlightLog(cfg.log_dir)
     log.info("Logging this session to %s", sess.log.path)
+    await sess.refresh_flight_plan()
     session_started = False
     rec = Recorder(cfg.input_device)
     pending: set[asyncio.Task] = set()
@@ -406,6 +431,7 @@ async def cmd_run(cfg) -> None:
 
 async def cmd_say(cfg, args) -> None:
     sess = Session(cfg)
+    await sess.refresh_flight_plan()
     if not args.no_play or args.out:
         await sess.prepare_voice()
     s = None

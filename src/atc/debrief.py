@@ -80,6 +80,8 @@ def render_transcript(records: list[dict]) -> str:
             lines.append(f"ATC {who}: {r['text'] if not r.get('silent') else '(no reply)'}")
             if r.get("situation"):
                 lines.append("  FACTS given to the controller:\n    " + r["situation"].replace("\n", "\n    "))
+        elif k == "flight_plan":
+            lines.append(f"\nFILED FLIGHT PLAN ({r.get('source', 'SimBrief')}): {r.get('summary', '')}")
         elif k == "atis":
             lines.append(f"\n[{when}] ATIS {r.get('airport')} information {r.get('letter')}: {r.get('text')}")
         elif k == "chatter":
