@@ -77,6 +77,39 @@ class Session:
                 self.local = LocalVoice(cfg.cache_dir, cfg.voice_threads)
             else:
                 log.warning("Local voice unavailable (kokoro-onnx not installed); using OpenRouter %s", cfg.tts_model)
+        self.stt_local = None  # LocalSTT when speech-to-text runs on this computer
+        if cfg.stt_engine == "local":
+            from .local_stt import LocalSTT
+
+            if LocalSTT.available():
+                self.stt_local = LocalSTT(cfg.cache_dir, cfg.stt_threads)
+            else:
+                log.warning("Local speech-to-text unavailable (onnx-asr not installed); using OpenRouter %s",
+                            cfg.stt_model)
+
+    @property
+    def stt_name(self) -> str:
+        return self.stt_local.name if self.stt_local else self.cfg.stt_model
+
+    async def prepare_stt(self) -> None:
+        """Download/load the local speech-to-text model up front."""
+        if self.stt_local:
+            log.info("Loading local speech-to-text...")
+            try:
+                await asyncio.to_thread(self.stt_local.load)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Local speech-to-text failed to load (%s); using OpenRouter %s", e, self.cfg.stt_model)
+                self.stt_local = None
+
+    async def transcribe(self, samples, wav: bytes, hint: str) -> str:
+        """Pilot audio -> text, locally when configured (OpenRouter if that fails)."""
+        if self.stt_local:
+            try:
+                return await asyncio.to_thread(self.stt_local.transcribe, samples)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Local speech-to-text failed (%s); using OpenRouter from now on", e)
+                self.stt_local = None
+        return await self.api.transcribe(wav, self.cfg.stt_model, hint)
 
     async def prepare_voice(self) -> None:
         """Download/load the local voice up front so the first transmission doesn't wait for it."""
@@ -311,6 +344,7 @@ async def cmd_run(cfg) -> None:
     xp = XPlane(cfg.xplane_host, cfg.xplane_port)
     sess = Session(cfg)
     await sess.prepare_voice()
+    await sess.prepare_stt()
     sess.log = FlightLog(cfg.log_dir)
     log.info("Logging this session to %s", sess.log.path)
     await sess.refresh_flight_plan()
@@ -318,6 +352,8 @@ async def cmd_run(cfg) -> None:
     rec = Recorder(cfg.input_device)
     pending: set[asyncio.Task] = set()
     last_status = [""]
+    audio_dir = sess.log.path.with_name(sess.log.path.stem + "-audio") if cfg.save_recordings else None
+    n_rec = [0]
 
     async def handle(samples, s: AircraftState):
         secs = samples.size / MIC_RATE
@@ -325,10 +361,21 @@ async def cmd_run(cfg) -> None:
             log.info("(PTT too short, ignored)")
             return
         try:
+            wav, hint = to_wav(samples), sess.stt_hint(s)
+            audio = None
+            if audio_dir:  # keep the recording for speech-to-text benchmarks (tools/stt_bench.py)
+                n_rec[0] += 1
+                audio_dir.mkdir(parents=True, exist_ok=True)
+                (audio_dir / f"{n_rec[0]:03d}.wav").write_bytes(wav)
+                audio = f"{audio_dir.name}/{n_rec[0]:03d}.wav"
             t0 = time.monotonic()
-            text = await sess.api.transcribe(to_wav(samples), cfg.stt_model, sess.stt_hint(s))
+            text = await sess.transcribe(samples, wav, hint)
+            stt_s = round(time.monotonic() - t0, 2)
             log.info("PILOT (COM%d %s): %s  [%.1fs]", s.tx_com, fmt_freq(s.tx_khz),
-                     text or "<nothing heard>", time.monotonic() - t0)
+                     text or "<nothing heard>", stt_s)
+            if audio:
+                sess.log.write("recording", audio=audio, secs=round(secs, 2), stt_model=sess.stt_name,
+                               hint=hint, text=text, stt_s=stt_s)
             if text:
                 nonlocal session_started
                 if not session_started:
@@ -429,6 +476,33 @@ async def cmd_run(cfg) -> None:
             log.info("Post-flight review: uv run atc debrief   (log: %s)", sess.log.path)
 
 
+async def cmd_transcribe(cfg, args) -> None:
+    """Transcribe WAV files with the configured engine (or --engine), with the time each took."""
+    import wave
+
+    import numpy as np
+    from scipy.signal import resample_poly
+
+    from .audio import MIC_RATE, to_wav
+
+    if args.engine:
+        cfg.stt_engine = args.engine
+    sess = Session(cfg)
+    await sess.prepare_stt()
+    for path in args.wavs:
+        with wave.open(path) as w:
+            rate, ch = w.getframerate(), w.getnchannels()
+            x = np.frombuffer(w.readframes(w.getnframes()), "<i2").astype(np.float32) / 32768
+        if ch > 1:
+            x = x.reshape(-1, ch).mean(axis=1)
+        if rate != MIC_RATE:
+            x = resample_poly(x, MIC_RATE, rate).astype(np.float32)
+        t0 = time.monotonic()
+        text = await sess.transcribe(x, to_wav(x), "Pilot radio call to air traffic control.")
+        print(f"{path}: [{time.monotonic() - t0:.2f}s {sess.stt_name}] {text}")
+    await sess.api.close()
+
+
 async def cmd_say(cfg, args) -> None:
     sess = Session(cfg)
     await sess.refresh_flight_plan()
@@ -514,6 +588,9 @@ def main() -> None:
     db_.add_argument("--model", help="override debrief_model")
     dp = sub.add_parser("datarefs", help="search X-Plane dataref names")
     dp.add_argument("text")
+    tp = sub.add_parser("transcribe", help="speech-to-text on WAV files (e.g. saved recordings), with timing")
+    tp.add_argument("wavs", nargs="+")
+    tp.add_argument("--engine", choices=["openrouter", "local"], help="override [audio] stt_engine")
     sp = sub.add_parser("say")
     sp.add_argument("text", nargs="?", default="", help="what the pilot says (not needed for ATIS)")
     sp.add_argument("--offline", action="store_true", help="don't try to connect to X-Plane")
@@ -542,6 +619,8 @@ def main() -> None:
             asyncio.run(cmd_monitor(cfg))
         elif args.cmd == "run":
             asyncio.run(cmd_run(cfg))
+        elif args.cmd == "transcribe":
+            asyncio.run(cmd_transcribe(cfg, args))
         elif args.cmd == "say":
             asyncio.run(cmd_say(cfg, args))
         elif args.cmd == "debrief":

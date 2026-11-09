@@ -38,6 +38,9 @@ class Config:
     stream_voice: bool = True
     voice_engine: str = "local"  # local (Kokoro on this computer) / openrouter (tts_model)
     voice_threads: int = 4  # CPU threads for the local voice
+    stt_engine: str = "openrouter"  # openrouter (stt_model) / local (Parakeet on this computer)
+    stt_threads: int = 4  # CPU threads for local speech-to-text
+    save_recordings: bool = False  # keep each PTT recording as a WAV next to the flight log
 
     chatter_mode: str = "always"  # always / traffic (only real AI traffic) / off
     chatter_min_gap: float = 45
@@ -104,6 +107,9 @@ def load(path: str | Path = "atc.toml") -> Config:
     cfg.stream_voice = bool(au.get("stream_voice", True))
     cfg.voice_engine = str(au.get("voice_engine", cfg.voice_engine)).lower()
     cfg.voice_threads = int(au.get("voice_threads", cfg.voice_threads))
+    cfg.stt_engine = str(au.get("stt_engine", cfg.stt_engine)).lower()
+    cfg.stt_threads = int(au.get("stt_threads", cfg.stt_threads))
+    cfg.save_recordings = bool(au.get("save_recordings", cfg.save_recordings))
 
     ch = data.get("chatter", {})
     cfg.chatter_mode = ch.get("mode", cfg.chatter_mode)

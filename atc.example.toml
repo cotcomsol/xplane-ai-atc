@@ -60,6 +60,15 @@ stream_voice = true
 voice_engine = "local"
 # CPU threads for the local voice (2 is enough on most machines; more = faster first audio)
 voice_threads = 4
+# Speech-to-text. "openrouter": stt_model above (~0.6-1 s, gets your callsign as a hint).
+# "local": NVIDIA Parakeet on this computer's CPU (~0.2 s, free; downloads ~620 MB into cache/ the
+# first time; no hint, so it misses "niner" now and then). Falls back to OpenRouter if it can't load.
+stt_engine = "openrouter"
+# CPU threads for local speech-to-text
+stt_threads = 4
+# Keep each push-to-talk recording as a WAV in logs/flight-<date>-<time>-audio/, with what the
+# speech-to-text model heard, for comparing speech-to-text models (tools/stt_bench.py).
+save_recordings = false
 
 [chatter]
 # Other aircraft talking to your controller. "always": X-Plane AI traffic when there is any, otherwise

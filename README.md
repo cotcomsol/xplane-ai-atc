@@ -83,7 +83,8 @@ The API key can also come from the `OPENROUTER_API_KEY` environment variable or 
 
 - X-Plane's airport data (all airports, runways, frequencies) is indexed into `cache/`, which takes
   a little while once.
-- The local voice model (~120 MB) is downloaded into `cache/kokoro` once.
+- The local voice model (~120 MB) is downloaded into `cache/kokoro` once (and the local speech-to-text
+  model, ~620 MB, the first time you use `stt_engine = "local"`).
 
 ## Usage
 
@@ -97,6 +98,8 @@ uv run atc say "Palo Alto Ground, Skyhawk one two three alpha bravo, request tax
 uv run atc say --offline --freq 118.6 --lat 37.46 --lon -122.11 "..."
                           # no X-Plane needed: fake aircraft state
 uv run atc datarefs tcas  # search X-Plane's dataref names
+uv run atc transcribe --engine local logs/flight-<...>-audio/001.wav
+                          # speech-to-text on WAV files, with timing
 ```
 
 On Windows, `run-atc.bat` runs `atc run`; `run-atc.bat monitor` etc. run the other commands.
@@ -131,6 +134,13 @@ Everything is in `atc.toml` (see `atc.example.toml` for all options and comments
   your email). The plan is used when it departs from the airport you're at. Its departure procedure is
   checked against X-Plane's CIFP data: one that doesn't serve the runway in use is amended to radar
   vectors to the first fix on your route.
+- `[audio] stt_engine = "local"` runs speech-to-text on your CPU with NVIDIA's Parakeet model (int8,
+  ~0.2 s per call instead of ~0.6-1 s, free) instead of OpenRouter. It can't take your callsign as a
+  hint, so it misses "niner" now and then (common cases are fixed up in code). If it can't load, it
+  falls back to OpenRouter. `stt_threads` sets its CPU threads.
+- `[audio] save_recordings = true` keeps every push-to-talk recording as a WAV next to the flight log.
+  `tools/stt_bench.py` compares speech-to-text models on them (local Parakeet and Whisper vs. the
+  OpenRouter model) for accuracy and speed; `tools/stt_clips.py` makes synthetic test calls.
 - `[chatter] mode`: `always` (AI traffic, else made-up aircraft), `traffic` (AI traffic only) or `off`.
 - `[xplane] cifp_dirs`: extra folders with CIFP approach data (X-Plane's own `Custom Data/CIFP`, then
   `Resources/default data/CIFP`, are searched as well).
