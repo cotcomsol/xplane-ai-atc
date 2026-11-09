@@ -38,6 +38,23 @@ def clean(text: str) -> str:
     return t.strip()
 
 
+# What Parakeet hears instead of the make in a callsign (no vocabulary hint to steer it). Applied only when
+# the aircraft is that make. From flight recordings; add more as they show up.
+MAKE_MISHEARINGS = {
+    "Cirrus": ["series", "serious", "sirius", "syrus", "syru", "cyrus", "sirus", "cirus", "crs"],
+    "Bonanza": ["binance", "bananza", "bonanzas", "banansa"],
+    "Skyhawk": ["sky hawk"],
+}
+
+
+def fix_make(text: str, make: str) -> str:
+    """'Series 828 Zulu Zulu' -> 'Cirrus 828 Zulu Zulu' in a Cirrus."""
+    words = MAKE_MISHEARINGS.get(make)
+    if not words:
+        return text
+    return re.sub(r"\b(" + "|".join(re.escape(w) for w in words) + r")\b", make, text, flags=re.I)
+
+
 class LocalSTT:
     def __init__(self, cache_dir: Path, threads: int = 4):
         # a plain folder, not the Hugging Face cache: onnxruntime refuses that cache's symlinked weight files

@@ -14,6 +14,7 @@ from .airports import AirportDB, Facility, bearing, dist_nm
 from .airspace import CLASS_B, airspace_class
 from .flightplan import FlightPlan, spoken_procedure
 from .phraseology import NUMBERS, altimeter_phrase, callsign_forms, region_for, spoken_runway, spoken_wind
+from .phraseology import altitude_words as _alt_words
 from .state import AircraftState, fmt_freq
 from .procedures import describe as describe_procedures
 from .procedures import load as load_procedures
@@ -31,8 +32,13 @@ RADAR_KINDS = ("APPROACH", "DEPARTURE", "CENTER")
 # A pilot transmission with any of these wants to go somewhere, not to park
 DEPARTURE_WORDS = (r"\b(depart|departure|take ?off|for runway|to runway|vfr|ifr|[a-z]+bound|pattern|closed traffic|"
                    r"touch and go|flight following|run ?up|to the (north|south|east|west))")
-ACK_TIMEOUT_S = 20
-ALT_CONFORMANCE_S = 60  # an aircraft level this long away from its assigned altitude gets queried  # chase an unacknowledged instruction after this long (real time)
+ACK_TIMEOUT_S = 20  # chase an unacknowledged instruction after this long (real time)
+ACK_CHASE = "The pilot has not acknowledged your last transmission"  # start of that event's text
+ALT_CONFORMANCE_S = 60  # an aircraft level this long away from its assigned altitude gets queried
+RECONTACT_S = 180  # a call this long after a facility's handoff is a new contact, not the goodbye
+FULL_STOP_KT = 25  # slower than this on the ground after a landing: the flight is over (not a touch and go)
+GROUND_TRAFFIC_AGL_FT = 100  # a target lower than this over a nearby airport is on the ground
+INBOUND_WORDS = r"\b(inbound|to land|for landing|full stop|touch and go|for the option)\b"
 EVENT_LABEL = "EVENT (no pilot transmission - you initiate this call)"
 
 SYSTEM_PROMPT = f"""You are an air traffic controller working one radio frequency in a flight simulator.
@@ -139,7 +145,8 @@ KIND_SUFFIX = {
 }
 ABBREV = {"TWR": "", "GND": "", "APP": "", "DEP": "", "CLNC": "", "DEL": "", "CD": "", "TRACON": "",
           "APCH": "", "CLR": "", "CTL": "", "ARR": "", "TOWER": "", "GROUND": "", "APPROACH": "",
-          "DEPARTURE": "", "CLEARANCE": "", "DELIVERY": ""}
+          "DEPARTURE": "", "CLEARANCE": "", "DELIVERY": "", "CTAF": "", "UNICOM": "", "UNIC": "", "ATCT": "",
+          "MULTICOM": ""}
 DIGITS = {"zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
           "seven": "7", "eight": "8", "niner": "9", "nine": "9"}
 
@@ -174,10 +181,25 @@ def short_name(a: dict) -> str:
     return clean or a["name"]
 
 
+# Airport ids that are also everyday words ("we'd like to fly the ILS" is not a flight to KFLY)
+_ID_WORDS = frozenset(
+    "act add age ago aid aim air all and any are arm art ask bad bag bar bay bed big bit bow box boy bus but buy "
+    "can car cut day did dry due eat end far few fit fix fly for fun gas get got had has her him his hot how its "
+    "jet job key law lay let lot low man map may men new nor not now off oil old one our out own pay pie put ran "
+    "red run sad saw say see set she sit six sky sun ten the top try two use via war was way who why win yes yet "
+    "you able also area away back base best both call came come copy does done down each east even ever fast "
+    "feet find five four from full gave gear give gone good half hand have head hear here high hold home just "
+    "keep kind know land last left less like line long look made make many mile more most much must near need "
+    "next nine none once only onto open over past plan read rest road roll same show side some soon stay stop "
+    "sure take taxi tell than that them then they this time told took turn unit upon very wait want well went "
+    "were west what when wind wing with word work your zero".split())
+
+
 def _airport_names(a: dict) -> list[str]:
     names = {a["id"].lower()}
     if len(a["id"]) == 4 and a["id"][0] in "KP":
         names.add(a["id"][1:].lower())
+    names -= _ID_WORDS
     for n in (a.get("city"), a["name"]):
         if n:
             clean = re.sub(r"\s+", " ", _NAME_NOISE.sub(" ", re.sub(r"[^A-Za-z ]", " ", n))).strip().lower()
@@ -205,6 +227,8 @@ def find_destination(db, transcript: str, fac) -> dict | None:
     for d, cand in db.nearby(a["lat"], a["lon"], radius_nm=250, limit=4000):
         for name in _airport_names(cand):
             for ti, tail in enumerate(tails):
+                if name not in tail:  # cheap test first: thousands of airports are checked per transmission
+                    continue
                 hit = re.search(r"\b" + re.escape(name) + r"\b", tail)
                 if hit:
                     key = (ti, hit.start(), -len(name), d)  # earliest, longest, nearest
@@ -221,7 +245,14 @@ _ALT_WORDS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "
 def parse_altitude(text: str) -> int | None:
     """'seven thousand five hundred', 'one zero thousand', '7,500', '7500 feet' -> feet."""
     t = text.lower().replace(",", "")
-    m = re.search(r"\b(\d{1,2})(\d)00\b(?:\s*(?:feet|ft))?", t)
+    m = re.search(r"\b(?:flight level|fl)\s*(\d{3})\b", t)
+    if m:
+        return int(m.group(1)) * 100
+    m = re.search(r"\bflight level\s+(\w+)[\s-]+(\w+)[\s-]+(\w+)", t)
+    if m and all(w in DIGITS for w in m.groups()):
+        return int("".join(DIGITS[w] for w in m.groups())) * 100
+    # a transponder code is not an altitude ("squawking 1200")
+    m = re.search(r"(?<!squawk )(?<!squawking )\b(\d{1,2})(\d)00\b(?:\s*(?:feet|ft))?", t)
     if m and int(m.group(1) + m.group(2) + "00") >= 1000:
         return int(m.group(1) + m.group(2) + "00")
     m = re.search(r"\b((?:one zero|one one|one two|one three|one four|one five|one six|one seven)|"
@@ -246,7 +277,6 @@ def ifr_cruise(field_elev: float, course_mag: float) -> int:
 
 def altitude_words(ft: int) -> str:
     """'four thousand five hundred'; 18,000 ft and up as a flight level ('flight level three six zero')."""
-    from .procedures import _alt_words
     if ft >= 18000:
         return "flight level " + " ".join(NUMBERS[c] for c in f"{int(round(ft / 100.0)):03d}")
     return _alt_words(ft)
@@ -312,6 +342,63 @@ def runway_in_use(airport: dict, wind_dir_true: float | None, wind_kt: float | N
     return rid, hdg
 
 
+def runway_true_hdg(airport: dict, rid: str) -> float | None:
+    for r in airport.get("runways", []):
+        if rid == r["ids"][0]:
+            return r["true_hdg"]
+        if len(r["ids"]) > 1 and rid == r["ids"][1]:
+            return (r["true_hdg"] + 180) % 360
+    return None
+
+
+def tailwind_kt(airport: dict, rid: str, wind_dir_true: float | None, wind_kt: float | None) -> float:
+    hdg = runway_true_hdg(airport, rid)
+    if hdg is None or wind_dir_true is None or not wind_kt:
+        return 0.0
+    return -wind_kt * math.cos(math.radians(wind_dir_true - hdg))
+
+
+MAX_TAILWIND_KT = 5  # an approach to the other end of the runway in use is fine up to this much tailwind
+_APPROACH_KINDS = {"ils": "ILS", "localizer": "LOC", "loc": "LOC", "rnav": "RNAV", "gps": "RNAV", "vor": "VOR"}
+
+
+def parse_approach_request(text: str) -> tuple[str, str] | None:
+    """'request the practice ILS runway three zero approach' -> ('ILS', '30'); 'RNAV3-0' -> ('RNAV', '30')."""
+    t = re.sub(r"(?<=[a-z])(?=\d)", " ", text.lower())
+    t = re.sub(r"(?<=\d)-(?=\d)", "", t)
+    m = re.search(r"\b(ils|localizer|loc|rnav|gps|vor)\b", t)
+    if not m:
+        return None
+    digits, side = "", ""
+    for w in re.findall(r"[a-z]+|\d+", t[m.end():])[:10]:
+        if w.isdigit() and not digits and len(w) <= 2:
+            digits = w
+        elif w in DIGITS and len(digits) < 2:
+            digits += DIGITS[w]
+        elif digits and w in ("left", "right", "center", "l", "r", "c"):
+            side = w[0].upper()
+            break
+        elif digits:
+            break
+    if not digits or not 1 <= int(digits) <= 36:
+        return None
+    return _APPROACH_KINDS[m.group(1)], f"{int(digits)}{side}"
+
+
+def approach_matches(kind: str, ap) -> bool:
+    """Does a published approach satisfy a requested kind (ILS, LOC, RNAV, VOR)?"""
+    k = ap.kind
+    return {"ILS": k == "ILS", "LOC": k in ("LOC", "ILS"), "RNAV": k.startswith("RNAV") or k == "GPS",
+            "VOR": k.startswith("VOR")}.get(kind, False)
+
+
+def runway_matches(requested: str, rwy: str) -> bool:
+    """'30' matches 30, 30L, 30R; '30L' only 30L; leading zeros ignored ('3' = '03')."""
+    num = lambda r: re.match(r"0*(\d+)", r).group(1) if re.match(r"\d", r) else r  # noqa: E731
+    side = lambda r: re.sub(r"^\d+", "", r)  # noqa: E731
+    return num(rwy) == num(requested) and (not side(requested) or side(rwy) == side(requested))
+
+
 def runway_end_position(airport: dict, lat: float, lon: float) -> str | None:
     """'on runway 28R' / 'at the approach end of runway 28R (holding short)' for an aircraft on the ground."""
     best = None
@@ -332,6 +419,8 @@ def clean_reply(text: str) -> str:
     """Keep plain ASCII speech: models occasionally emit stray foreign characters,
     quotes or markdown, which the voice would try to read."""
     text = text.replace("\u2019", "'").replace("\u2014", ", ").replace("\u2013", "-")
+    # the no-reply token, however the model mangles it ("<s ilence>", "[silence]", "(silence)")
+    text = re.sub(r"[<\[(]\s*s\s*i\s*l\s*e\s*n\s*c\s*e\s*[>\])]", SILENCE, text, flags=re.I)
     text = re.sub(r"[^A-Za-z0-9 ,.'?!<>/-]+", " ", text)
     text = re.sub(r"\s+([,.?!])", r"\1", re.sub(r"\s+", " ", text))
     return text.strip(" ,")
@@ -349,7 +438,8 @@ def parse_heading(text: str) -> int | None:
 def instruction_altitude(text: str) -> int | None:
     """Altitude from 'climb/descend and maintain ...' or 'maintain ...' (not 'until established')."""
     low = text.lower()
-    m = re.search(r"\b(?:climb and maintain|descend and maintain|maintain)\s+(.+?thousand(?: \w+ hundred)?)", low)
+    m = re.search(r"\b(?:climb and maintain|descend and maintain|maintain)\s+"
+                  r"(flight level \w+[\s-]+\w+[\s-]+\w+|.+?thousand(?: \w+ hundred)?)", low)
     if m and "until established" not in low[m.start():m.end() + 25] and "vfr" not in m.group(0):
         return parse_altitude(m.group(1))
     return None
@@ -380,6 +470,11 @@ class Controller:
         self.ifr_plan: dict | None = None  # clearance we're about to issue
         self.ifr_clearance: dict | None = None  # clearance issued: {dest, initial, cruise, route, sid, fix}
         self.flight_plan: FlightPlan | None = None  # filed plan (SimBrief)
+        self.requested_approach: tuple[str, str] | None = None  # (ILS/LOC/RNAV/VOR, runway) the pilot asked for
+        self.arrival_rwy: tuple[str, str] | None = None  # (airport id, runway) when it isn't the wind runway
+        self._last_pilot_fac: str | None = None  # facility key of the pilot's previous transmission
+        self.intent_said = False  # the pilot said what they'll do at the end of the approach / this lap
+        self.missed_reported = False  # the pilot reported a missed approach (practice), not yet answered for
         self._expect_prompted = False
         self.ifr_climb_given = False
         self.assigned_alt: int | None = None
@@ -401,8 +496,15 @@ class Controller:
         self.atis_reported: dict[str, str] = {}  # airport id -> ATIS letter the pilot reported
         self.destination: dict | None = None  # airport the pilot said they're going to
         self.landed_at: str | None = None  # airport id of the last landing (cleared when airborne)
-        self._last_airborne: float | None = None  # sim time (zulu sec or wall clock) last seen airborne
         self._was_airborne = False
+        self._rollout = False  # landed, still rolling out: a full stop ends the flight, a touch and go doesn't
+        self._clock: float | None = None  # last value of _now(): sim time that never wraps or runs backwards
+        self._zulu_prev: float | None = None
+        self._sim_t = 0.0
+        self._pending_code: str | None = None  # squawk offered to the model, not yet assigned
+        self._clearance_prompted = False  # the "in position, clear the approach" call was made
+        self._last_vector: tuple[float | None, int | None] = (None, None)  # (clock, heading) of the last vector
+        self.handoff_at: dict[str, float] = {}  # facility key -> when its frequency change was said (real time)
         self.exit_issued = False
         self._rng = random.Random()
 
@@ -433,12 +535,28 @@ class Controller:
         elif re.search(r"\b(depart(ing)?|frequency change|leaving the pattern|out of the pattern|full stop)\b",
                        transcript, re.I):
             self.pattern_work = False
+        req = parse_approach_request(transcript)
+        if req:  # a new approach: its ending (full stop, low approach, option) isn't known yet
+            self.requested_approach = req
+            self.intent_said = self.missed_reported = False
+            self.pattern_kind = None
         m_kind = re.search(r"touch and go|stop and go|the option|low approach|full stop", transcript, re.I)
         if m_kind:
             k = m_kind.group(0).lower().replace("the option", "option")
             self.pattern_kind = None if k == "full stop" else k
+            self.intent_said = True
         if re.search(r"\bgo(ing)? around\b", transcript, re.I):
             self._lap["go_around_reported"] = True
+        if re.search(r"\b(missed approach|going missed|on the missed|executing the missed)\b", transcript, re.I):
+            self.missed_reported = self.intent_said = True
+            self.pattern_kind = "low approach"
+            self._lap["go_around_reported"] = True  # not a surprise go-around
+            self.ifr_approach = self.approach_cleared = False  # that approach is over
+            self.requested_approach = None
+            # ... and the next one gets its own vectors, approach clearance and landing clearance
+            self._clearance_prompted = self.landing_cleared = False
+            self._last_vector = (None, None)
+            self._lap = {"go_around_reported": True}
         alt = parse_altitude(transcript)
         if alt and re.search(r"\b(request|filed|cruise|cruising|at|altitude|to)\b", transcript, re.I):
             self.requested_alt = alt
@@ -451,7 +569,71 @@ class Controller:
         p = self.flight_plan
         return p if p and a and p.origin == a["id"] else None
 
+    def _recontact(self, fac: Facility | None, transcript: str) -> None:
+        """The pilot is back on a frequency that handed it off earlier (e.g. the tower after departure, now
+        inbound): that facility starts over instead of treating the call as a goodbye."""
+        if not transcript or not fac:
+            return
+        if fac.key in self.handed_off:
+            said = self.handoff_at.get(fac.key)
+            elsewhere = bool(self._last_pilot_fac) and self._last_pilot_fac != fac.key
+            later = said is not None and _time.monotonic() - said > RECONTACT_S
+            inbound = fac.kind == "TOWER" and bool(re.search(INBOUND_WORDS, transcript, re.I))
+            if elsewhere or later or inbound:
+                self._forget_handoff(fac.key)
+                self.takeoff_cleared.discard(fac.key)
+                self.history.pop(fac.key, None)
+        self._last_pilot_fac = fac.key
+
+    def _forget_handoff(self, key: str) -> None:
+        self.handed_off.discard(key)
+        self.handoff_said.pop(key, None)
+        self.handoff_at.pop(key, None)
+
+    def _practice_intent_unknown(self) -> bool:
+        return (self.flight_rules == "VFR" and not self.intent_said and not self.landing_cleared
+                and bool(self.ifr_approach or self.approach_cleared or self.requested_approach))
+
+    def _runway(self, a: dict, s: AircraftState) -> tuple[str, float] | None:
+        """Runway in use for this airport: the wind's, or the arrival runway an approach was approved to."""
+        ar = self.arrival_rwy
+        if ar and ar[0] == a["id"] and not s.on_ground:
+            hdg = runway_true_hdg(a, ar[1])
+            if hdg is not None:
+                return ar[1], hdg
+        return runway_in_use(a, s.wind_dir, s.wind_kt)
+
+    def _request_note(self, procs, rwy: str, apt: dict, s: AircraftState) -> str | None:
+        """What to tell a pilot whose requested approach isn't the one being set up."""
+        req = self.requested_approach
+        if not req or self.approach_cleared:
+            return None
+        kind, rq = req
+        wind_rwy = (runway_in_use(apt, s.wind_dir, s.wind_kt) or ("",))[0]
+        here = [ap for ap in procs.for_runway_all() if approach_matches(kind, ap) and runway_matches(rq, ap.runway)]
+        if here and here[0].runway == rwy:
+            if rwy != wind_rwy:
+                return (f"The pilot's requested {here[0].spoken} is approved (the wind allows runway {rwy}); "
+                        f"the tower will land it on runway {rwy}.")
+            return None
+        if here:
+            return (f"The pilot asked for the {here[0].spoken}, but the wind is too strong for runway {rq}: say "
+                    f"\"unable {here[0].spoken.replace(' approach', '')}, wind favors runway "
+                    f"{spoken_runway(wind_rwy)}\" and offer the default approach listed above.")
+        alts = sorted((ap for ap in procs.for_runway_all() if approach_matches(kind, ap)
+                       and tailwind_kt(apt, ap.runway, s.wind_dir, s.wind_kt) <= MAX_TAILWIND_KT),
+                      key=lambda ap: ap.runway[:2] != wind_rwy[:2])  # the runway in use first
+        txt = (f"PILOT ASKED FOR the {kind} runway {rq}: there is NO {kind} approach to runway {rq} at {apt['id']}. "
+               f"Don't switch approaches without saying so: tell the pilot (e.g. \"no {kind} runway "
+               f"{spoken_runway(rq)}\")")
+        if alts:
+            return txt + (f", and offer the {alts[0].spoken} (the wind allows it) or the default approach listed "
+                          f"above: \"the {alts[0].spoken.replace(' approach', '')} is available, say "
+                          "intentions\". Until the pilot picks, don't clear any approach.")
+        return txt + " and say \"expect <the default approach listed above>\"."
+
     def situation(self, s: AircraftState, fac: Facility | None, callsign: str, transcript: str = "") -> str:
+        self._recontact(fac, transcript)
         self.observe(transcript, fac)
         plan = self._filed_for(fac.airport) if fac and fac.kind != "CENTER" and s.on_ground else None
         if plan and not self.ifr_clearance and (self.destination is None or self.flight_rules == "IFR"):
@@ -518,7 +700,7 @@ class Controller:
             elif aclass in ("B", "C") and s.on_ground and fac.kind in ("GROUND", "DELIVERY", "TOWER"):
                 lines.append(self._departure_flow(a, fac, aclass))
             if fac.kind in ("TOWER", "GROUND", "DELIVERY"):
-                rw = runway_in_use(a, s.wind_dir, s.wind_kt)
+                rw = self._runway(a, s)
                 if rw:
                     rhdg = round((rw[1] - magvar) % 360) or 360
                     lines.append(f"RUNWAY IN USE: {rw[0]} (heading {rhdg:03d})")
@@ -536,6 +718,21 @@ class Controller:
                         else:
                             lines.append(f"Landing clearance wording: \"{wc}runway {r}, {self._landing_phrase()}\" "
                                          "(when the aircraft is on downwind/base/final and no clearance was given yet)")
+                            if fac.kind == "TOWER" and self.missed_reported:
+                                dep = departure_freq(a)
+                                dep_txt = f"contact {dep[0]} {fmt_freq(dep[1])}" if dep else "frequency change approved"
+                                lines.append(
+                                    "MISSED APPROACH reported (practice approach): don't clear it to land. Reply "
+                                    "\"<callsign>, roger\" plus what comes next: another approach -> "
+                                    f"\"{dep_txt}\"; the pattern -> \"make left traffic runway {r}\"; leaving "
+                                    "-> \"frequency change approved\"; if they haven't said, \"say intentions\".")
+                            elif fac.kind == "TOWER" and self._practice_intent_unknown():
+                                lines.append(
+                                    "PRACTICE APPROACH inbound, the pilot hasn't said how it ends: on the check-in say "
+                                    "\"<callsign>, <tower name>, continue, say intentions after the approach\" (full "
+                                    "stop, low approach or the option). Clear it once known: full stop -> cleared to "
+                                    "land; low approach -> \"cleared low approach\"; option -> \"cleared for the "
+                                    "option\".")
                     turn = departure_turn(transcript, rhdg)
                     if fac.kind == "TOWER" and s.on_ground and turn:
                         lines.append(f"Requested departure direction: right after the callsign, approve it with "
@@ -638,11 +835,14 @@ class Controller:
                             "\nNOT RADAR IDENTIFIED YET: no vectors or approach clearance until radar contact. "
                             "For now assign the squawk (if none) and say \"expect <approach>\".")
                     lines.append(block)
+                    note = self._request_note(procs, rwy, ctx[2], s)
+                    if note:
+                        lines.append(note)
                     others = sorted({a.name for a in procs.approaches.values() if a.runway != rwy})
                     if others:
                         lines.append(f"Other approaches at {procs.airport} (other runways): {', '.join(others)}")
             if fac.kind in RADAR_KINDS and self.db:
-                for d, b in self.db.nearby(s.lat, s.lon, radius_nm=30, limit=40):
+                for d, b in self.db.nearby(s.lat, s.lon, radius_nm=30, limit=2000):
                     if b["id"] in CLASS_B:
                         lines.append(f"Class B airspace nearby: {b['id']} Class Bravo, {d:.0f} nm "
                                      f"{_compass(bearing(s.lat, s.lon, b['lat'], b['lon']))}")
@@ -804,7 +1004,7 @@ class Controller:
         return f"DEPARTURE FLOW (Class {aclass}): for a VFR departure, {issue}."
 
     def _next_code_cached(self) -> str:
-        if not getattr(self, "_pending_code", None):
+        if not self._pending_code:
             self._pending_code = self._next_code()
         return self._pending_code
 
@@ -833,15 +1033,24 @@ class Controller:
         if not event:
             self.awaiting_ack = None  # the pilot spoke: whatever we were waiting for got an answer
             self.observe(transcript, fac)
-        if fac and re.search(r"\b(heading|maintain|descend|climb|cleared|contact|squawk|hold short|cross runway|"
-                             r"line up|taxi)\b", low := reply.lower()) and SILENCE not in reply:
+        if (self.missed_reported and fac and fac.kind == "TOWER" and reply and SILENCE not in reply
+                and "intentions" not in reply.lower()):
+            self.missed_reported = False  # answered: what's next is pattern / another approach / leaving
+            self.pattern_kind = None
+            self.intent_said = False
+        low = reply.lower()
+        said = re.sub(r"\bradar contact\b", " ", low)  # "radar contact" is neither an instruction nor a handoff
+        # the chase for an unanswered instruction is made once: repeating the instruction doesn't restart it
+        chase = event and transcript.startswith(ACK_CHASE)
+        if fac and not chase and SILENCE not in reply and re.search(
+                r"\b(heading|maintain|descend|climb|cleared|contact|squawk|hold short|cross runway|line up|taxi)\b",
+                said):
             self.awaiting_ack = (_time.monotonic(), fac.key, reply)
             self.ack_chased = False
         if fac and not event:
             m = re.search(r"\b(?:information|with|have)\s+(" + "|".join(ALPHABET_WORDS) + r")\b", transcript, re.I)
             if m:
                 self.atis_reported[fac.airport["id"]] = m.group(1).capitalize().replace("Xray", "X-ray")
-        low = reply.lower()
         code = words_to_code(reply)
         if code and code != self.assigned_code:
             self.assigned_code = code
@@ -860,7 +1069,8 @@ class Controller:
         hdg = parse_heading(reply)
         if hdg is not None:
             self.assigned_hdg = hdg
-            self._last_vector = (self._clock or _time.time(), hdg)  # an event won't repeat it right away
+            # an event won't repeat it right away
+            self._last_vector = (self._clock if self._clock is not None else _time.time(), hdg)
         if re.search(r"resume own navigation|proceed direct|cleared direct|own navigation", low):
             self.assigned_hdg = None
         if "climb and maintain" in low:
@@ -877,23 +1087,61 @@ class Controller:
             self.landing_cleared = True
         if fac and "cleared for takeoff" in low:
             self.takeoff_cleared.add(fac.key)
-        if fac and (re.search(r"\bcontact\b.*\b(departure|approach|center|radar|tower|ground)\b", low)
+            self._forget_handoff(fac.key)  # a new departure: an earlier flight's frequency change is history
+        if fac and (re.search(r"\bcontact\b.*\b(departure|approach|center|radar|tower|ground)\b", said)
                     or "frequency change approved" in low) and SILENCE not in reply:
             self.handed_off.add(fac.key)
             self.handoff_said[fac.key] = re.sub(r"^[^,]*,\s*", "", reply.strip())
+            self.handoff_at[fac.key] = _time.monotonic()
 
     def _now(self, s: AircraftState) -> float:
-        import time
+        """Seconds on a clock that follows sim time (so it stops with the sim) but, unlike zulu time,
+        never wraps at 0000Z or runs backwards. Wall clock when the sim gives no time."""
+        z = s.zulu_sec
+        if z is None:
+            self._clock = _time.time()
+            return self._clock
+        if self._zulu_prev is None:
+            self._sim_t = z
+        else:
+            d = z - self._zulu_prev
+            if d < -43200:  # passed 0000Z
+                d += 86400
+            self._sim_t += max(0.0, d)
+        self._zulu_prev = z
+        self._clock = self._sim_t
+        return self._clock
 
-        return s.zulu_sec if s.zulu_sec is not None else time.time()
+    def shift_timers(self, dt: float) -> None:
+        """The sim was paused for dt seconds: real-time timers don't count them."""
+        if self.awaiting_ack:
+            t, key, text = self.awaiting_ack
+            self.awaiting_ack = (t + dt, key, text)
+        if self._alt_off_since is not None:
+            self._alt_off_since += dt
+        self.handoff_at = {k: t + dt for k, t in self.handoff_at.items()}
 
-    _clock = 0.0
+    def _end_flight(self) -> None:
+        """Full stop after a landing: the next departure starts clean (rules, clearance, squawk, destination)."""
+        self.flight_rules = "VFR"
+        self.ifr_plan = self.ifr_clearance = None
+        self.ifr_climb_given = self._expect_prompted = False
+        self.assigned_alt = self.requested_alt = None
+        self._alt_off_since = None
+        self._alt_chased = False
+        self.assigned_code = self._pending_code = None
+        self.identified = False
+        self.destination = None
+        self.takeoff_cleared.clear()
 
     def _track_phase(self, s: AircraftState) -> None:
         """Notice takeoffs and landings."""
-        self._clock = self._now(s)
+        self._now(s)
+        if s.on_ground and self._rollout and s.gs_kt < FULL_STOP_KT:
+            self._rollout = False
+            self._end_flight()
         if not s.on_ground:
-            self._last_airborne = self._now(s)
+            self._rollout = False
             if not self._was_airborne:
                 self.landed_at = None
                 self.exit_issued = False
@@ -907,9 +1155,12 @@ class Controller:
                 if near and on_runway(near[0][1], s.lat, s.lon):
                     self.landed_at = near[0][1]["id"]
                     self.ifr_approach = self.approach_cleared = False
+                    self.requested_approach = self.arrival_rwy = None
+                    self.intent_said = self.missed_reported = False
                     self.assigned_hdg = None
                     self._clearance_prompted = False
                     self._last_vector = (None, None)
+                    self._rollout = True
 
     def _handles_arrival(self, s: AircraftState, fac: Facility, transcript: str = "") -> bool:
         """Is this radar controller the one to set up the destination approach?"""
@@ -932,10 +1183,20 @@ class Controller:
         procs = load_procedures(self.xplane_path, apt["id"], self.cifp_dirs)
         if not procs or not procs.approaches:
             return None
-        rw = runway_in_use(apt, s.wind_dir, s.wind_kt)
+        rw = self._runway(apt, s)
         if not rw:
             return None
-        return procs, rw[0], apt
+        rwy = rw[0]
+        req = self.requested_approach
+        if req and not self.approach_cleared:  # the pilot's requested approach, if it exists and the wind allows
+            ok = [ap for ap in procs.for_runway_all() if approach_matches(req[0], ap) and runway_matches(req[1], ap.runway)
+                  and tailwind_kt(apt, ap.runway, s.wind_dir, s.wind_kt) <= MAX_TAILWIND_KT
+                  and runway_true_hdg(apt, ap.runway) is not None]
+            if ok:
+                rwy = ok[0].runway
+                wind = runway_in_use(apt, s.wind_dir, s.wind_kt)
+                self.arrival_rwy = (apt["id"], rwy) if wind and wind[0] != rwy else None
+        return procs, rwy, apt
 
     def _approach_event(self, s: AircraftState, fac: Facility) -> str | None:
         if fac.kind not in RADAR_KINDS or not self.ifr_approach or s.on_ground:
@@ -952,16 +1213,17 @@ class Controller:
             return None
         if not self.approach_cleared and self._radar_identified(s):
             ready, hdg, v = approach_vector_plan(aps[0], thr, s.lat, s.lon, s.magvar, s.hdg_mag, s.alt_ft)
-            if ready and not getattr(self, "_clearance_prompted", False):
+            if ready and not self._clearance_prompted:
                 self._clearance_prompted = True
                 return ("The aircraft is now in position to join final. Start with the callsign and issue the "
                         "approach clearance (the approach you told the pilot to expect) exactly as worded: " + v)
             off = abs((hdg - s.hdg_mag + 540) % 360 - 180)
             now = self._now(s)
-            last_t, last_h = getattr(self, "_last_vector", (None, None))
+            last_t, last_h = self._last_vector
+            since = float("inf") if last_t is None or last_t > now else now - last_t
             # Re-vector when well off the needed heading; give the pilot time to comply with the last one
-            if not ready and off > 25 and (last_t is None or now - last_t > 45) and (
-                    last_h is None or abs((hdg - last_h + 540) % 360 - 180) > 15 or now - last_t > 120):
+            if not ready and off > 25 and since > 45 and (
+                    last_h is None or abs((hdg - last_h + 540) % 360 - 180) > 15 or since > 120):
                 self._last_vector = (now, hdg)
                 return ("Vector the aircraft toward the final approach course (it is flying heading "
                         f"{s.hdg_mag:03.0f}): " + v.split("VECTOR NOW: ")[-1] + " Start with the callsign, then "
@@ -1069,19 +1331,34 @@ class Controller:
             self.pattern_kind or "", "cleared to land")
 
     def _pattern_state(self, a: dict, s: AircraftState):
-        rw = runway_in_use(a, s.wind_dir, s.wind_kt)
+        rw = self._runway(a, s)
         if not rw:
             return None
         rwy = rw[0]
         own = pattern_position(a, rwy, s.lat, s.lon, s.agl_ft, (s.hdg_mag + s.magvar) % 360)
         others = []
         for t in s.traffic or []:
-            if t.lat is None or t.alt_ft is None:
-                continue
+            if t.lat is None or t.alt_ft is None or t.alt_ft - a["elev"] < GROUND_TRAFFIC_AGL_FT:
+                continue  # unknown position, or taxiing / parked
             p = pattern_position(a, rwy, t.lat, t.lon, t.alt_ft - a["elev"], t.hdg_true)
             if p:
                 others.append((traffic_type(t), p))
         return rwy, own, others
+
+    def _airborne_traffic(self, s: AircraftState, fac: Facility) -> list:
+        """Targets worth a traffic call: not the ones taxiing or parked at an airport."""
+        if fac.kind == "TOWER":
+            fields = [fac.airport]
+        else:
+            fields = [a for _, a in self.db.nearby(s.lat, s.lon, radius_nm=12, limit=30)] if self.db else []
+        out = []
+        for t in s.traffic or []:
+            if t.lat is not None and t.lon is not None and t.alt_ft is not None and any(
+                    t.alt_ft - a["elev"] < GROUND_TRAFFIC_AGL_FT and dist_nm(t.lat, t.lon, a["lat"], a["lon"]) < 2.5
+                    for a in fields):
+                continue
+            out.append(t)
+        return out
 
     def _pattern_facts(self, a: dict, s: AircraftState) -> list[str]:
         st = self._pattern_state(a, s)
@@ -1116,11 +1393,13 @@ class Controller:
         # Go-around: was on short final, now climbing away without landing
         if own and own.leg == "final" and own.path_nm < 1.0 and s.agl_ft < 400:
             lap["short_final"] = True
-        if lap.get("short_final") and not lap.get("go_around_handled") and s.agl_ft > 500 and s.vs_fpm > 300:
-            lap["go_around_handled"] = True
-            self.landing_cleared = False
-            if lap.get("go_around_reported"):
-                return None
+        if lap.get("short_final") and s.agl_ft > 500 and s.vs_fpm > 300:
+            expected = lap.get("go_around_reported") or self.pattern_kind in ("low approach", "option")
+            # climbing away without landing: a new lap, with its own sequencing and landing clearance
+            self._lap = {}
+            self.landing_cleared = self._clearance_prompted = False
+            if expected:
+                return None  # reported, or a low approach / option it was cleared for
             return (f"The aircraft went around without saying so. Acknowledge and give pattern instructions: "
                     f"\"<callsign>, roger, make left traffic runway {r}, report downwind\".")
         if not own:
@@ -1144,7 +1423,8 @@ class Controller:
         # Landing clearance when on base/final without one
         if own.leg in ("base", "final") and own.path_nm < 3 and not self.landing_cleared and not lap.get("clr_chased"):
             lap["clr_chased"] = True
-            land = self._landing_phrase()
+            # a practice approach whose ending the pilot never said: the option covers all of them
+            land = "cleared for the option" if self._practice_intent_unknown() else self._landing_phrase()
             num = f"number {n}, follow the {ahead}, " if ahead else ""
             return (f"The aircraft is on {own.describe(rwy)} without a landing clearance. Say: \"<callsign>, {num}"
                     f"{w + ', ' if w else ''}runway {r}, {land}\".")
@@ -1198,7 +1478,7 @@ class Controller:
         if self.awaiting_ack and self.awaiting_ack[1] == fac.key and not self.ack_chased \
                 and _time.monotonic() - self.awaiting_ack[0] > ACK_TIMEOUT_S:
             self.ack_chased = True
-            return (f"The pilot has not acknowledged your last transmission (\"{self.awaiting_ack[2]}\"). Call them: "
+            return (f"{ACK_CHASE} (\"{self.awaiting_ack[2]}\"). Call them: "
                     "the callsign and \"how do you hear?\", or repeat the instruction once.")
         if fac.kind in RADAR_KINDS and self.assigned_alt and not s.on_ground and not self._alt_chased:
             diff = s.alt_ft - self.assigned_alt
@@ -1235,7 +1515,7 @@ class Controller:
         if not s.on_ground and s.traffic and (
                 (fac.kind in RADAR_KINDS and self._radar_identified(s)) or
                 (fac.kind == "TOWER" and dist_nm(s.lat, s.lon, fac.airport["lat"], fac.airport["lon"]) < 6)):
-            t = self.traffic_watch.due(s.traffic)
+            t = self.traffic_watch.due(self._airborne_traffic(s, fac))
             if t:
                 return f"Issue a traffic advisory, exactly: \"<callsign>, {traffic_advisory(t)}\"."
         if fac.kind == "TOWER" and fac.key in self.takeoff_cleared and fac.key not in self.handed_off \

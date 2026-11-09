@@ -26,6 +26,7 @@ from .xplane import XPlane
 log = logging.getLogger("atc")
 
 NO_ATC_KINDS = ("CTAF", "ATIS")
+EVENT_MAX_DEFER_S = 45.0  # a controller-initiated call held back while the pilot talked; dropped when older
 REMOTE_VOICE_TIMEOUT_S = 6.0  # OpenRouter TTS: retry when the first audio takes longer
 
 
@@ -55,6 +56,12 @@ async def cmd_monitor(cfg) -> None:
         task.cancel()
 
 
+def readback_window(reply: str) -> float:
+    """Seconds to leave the pilot after a transmission before the controller starts another call:
+    reaction time plus roughly the time to read it back (an approach clearance gets ~13 s)."""
+    return min(14.0, 3.0 + 0.3 * len(reply.split()))
+
+
 class Session:
     """Everything needed to turn a pilot transmission into a controller reply."""
 
@@ -70,6 +77,10 @@ class Session:
         self.log = None  # FlightLog when recording a session
         self.local = None  # LocalVoice when the voice is generated on this computer
         self._plan_checked = 0.0  # monotonic time of the last SimBrief fetch
+        self.ptt_presses = 0  # counts PTT key-ups, so a controller call started before one isn't played over it
+        self.quiet_until = 0.0  # no controller-initiated calls or chatter before this (monotonic): readback time
+        self.deferred_event: tuple[str, float] | None = None  # (event, monotonic time) to retry when quiet
+        self.transmitting = lambda: False  # is the pilot's PTT down right now? (set by `atc run`)
         if cfg.voice_engine == "local":
             from .local_tts import LocalVoice
 
@@ -101,11 +112,15 @@ class Session:
                 log.warning("Local speech-to-text failed to load (%s); using OpenRouter %s", e, self.cfg.stt_model)
                 self.stt_local = None
 
-    async def transcribe(self, samples, wav: bytes, hint: str) -> str:
+    async def transcribe(self, samples, wav: bytes, hint: str, icao_type: str = "") -> str:
         """Pilot audio -> text, locally when configured (OpenRouter if that fails)."""
         if self.stt_local:
             try:
-                return await asyncio.to_thread(self.stt_local.transcribe, samples)
+                from .local_stt import fix_make
+                from .phraseology import type_name
+
+                text = await asyncio.to_thread(self.stt_local.transcribe, samples)
+                return fix_make(text, type_name(icao_type)) if icao_type else text
             except Exception as e:  # noqa: BLE001
                 log.warning("Local speech-to-text failed (%s); using OpenRouter from now on", e)
                 self.stt_local = None
@@ -172,10 +187,14 @@ class Session:
                      "information, ready for departure, request, VFR, flight following.")
         return " ".join(parts)
 
+    def quiet(self) -> bool:
+        return time.monotonic() >= self.quiet_until
+
     async def respond(self, transcript: str, s: AircraftState, play: bool = True,
                       out_wav: str | None = None, event: bool = False) -> str | None:
         async with self._lock:
             t0 = time.monotonic()
+            presses = self.ptt_presses
             fac = _facility(self.db, s)
             if fac is None or fac.kind in NO_ATC_KINDS:
                 what = f"{fac.airport['id']} {fac.kind}" if fac else "no ATC facility found"
@@ -194,6 +213,11 @@ class Session:
                                         reasoning_effort=self.cfg.reasoning_effort, timeout=8, retry_timeout=20)
             reply = clean_reply(reply)
             t1 = time.monotonic()
+            if event and self.ptt_presses != presses:
+                # the pilot keyed up while this call was being prepared: don't talk over them; retry once quiet
+                log.info("(ATC-initiated call held: the pilot is transmitting)")
+                self.deferred_event = (transcript, t0)
+                return None
             self.ctl.remember(fac, transcript, reply, event=event)
             if self.log:
                 self.log.write("atc", facility=f"{fac.airport['id']} {fac.kind}", text=reply,
@@ -201,10 +225,17 @@ class Session:
                                trigger=transcript if event else None, situation=situation, state=snapshot(s))
             if not reply or SILENCE in reply:
                 log.info("ATC (%s): <no reply>  [%.1fs]", fac.name, t1 - t0)
+                if not event:
+                    self.quiet_until = time.monotonic() + 2.0  # readback taken: a short gap, then free to talk
                 return None
             log.info("ATC (%s): %s  [model %.1fs]", fac.name, reply, t1 - t0)
+            if play:  # the pilot keyed up again while this was prepared: answer once they let go
+                waited = time.monotonic()
+                while self.transmitting() and time.monotonic() - waited < 60:
+                    await asyncio.sleep(0.1)
             if play or out_wav:
                 await self.speak(reply, fac, play=play, out_wav=out_wav)
+            self.quiet_until = time.monotonic() + readback_window(reply)
             return reply
 
     async def _remote_chunks(self, text: str, voice: str):
@@ -221,7 +252,7 @@ class Session:
             except asyncio.TimeoutError:
                 await gen.aclose()
                 if attempt == 2:
-                    raise RuntimeError(f"voice took over {REMOTE_VOICE_TIMEOUT_S * 2:.0f}s")
+                    raise RuntimeError(f"voice took over {REMOTE_VOICE_TIMEOUT_S * 2:.0f}s") from None
                 log.warning("  [voice slow (> %.0fs), retrying]", REMOTE_VOICE_TIMEOUT_S)
                 continue
             yield first[0], pcm16_to_float(first[1])
@@ -350,6 +381,7 @@ async def cmd_run(cfg) -> None:
     await sess.refresh_flight_plan()
     session_started = False
     rec = Recorder(cfg.input_device)
+    sess.transmitting = lambda: rec.recording
     pending: set[asyncio.Task] = set()
     last_status = [""]
     audio_dir = sess.log.path.with_name(sess.log.path.stem + "-audio") if cfg.save_recordings else None
@@ -369,7 +401,7 @@ async def cmd_run(cfg) -> None:
                 (audio_dir / f"{n_rec[0]:03d}.wav").write_bytes(wav)
                 audio = f"{audio_dir.name}/{n_rec[0]:03d}.wav"
             t0 = time.monotonic()
-            text = await sess.transcribe(samples, wav, hint)
+            text = await sess.transcribe(samples, wav, hint, s.icao_type)
             stt_s = round(time.monotonic() - t0, 2)
             log.info("PILOT (COM%d %s): %s  [%.1fs]", s.tx_com, fmt_freq(s.tx_khz),
                      text or "<nothing heard>", stt_s)
@@ -391,6 +423,7 @@ async def cmd_run(cfg) -> None:
 
     def on_ptt(active: bool):
         if active:
+            sess.ptt_presses += 1
             sess.player.stop()  # pilot keys up over ATC: cut ATC off
             try:
                 rec.start()
@@ -405,43 +438,61 @@ async def cmd_run(cfg) -> None:
             pending.add(t)
             t.add_done_callback(pending.discard)
 
-    async def atis_loop():
+    atis_playing = [None, None]  # (facility key, letter) being broadcast, and its audio
+
+    async def atis_tick():
         from . import atis
 
-        playing_key = None
-        audio = None
+        if not (xp.connected and xp.values):
+            return
+        s = AircraftState.from_values(xp.values)
+        fac = _atis_facility(sess.db, s)
+        if fac is None:
+            if atis_playing[0]:
+                atis_playing[0] = None
+                if not sess.busy:  # (a controller's reply may be playing by now: leave that alone)
+                    sess.player.stop()
+            return
+        if rec.recording or sess.busy:
+            return
+        text, letter = atis.build(fac, s)
+        key = (fac.key, letter)
+        if key != atis_playing[0]:
+            sess.player.stop()
+            log.info("ATIS %s: %s", fac.airport["id"], text)
+            sess.log.write("atis", airport=fac.airport["id"], letter=letter, text=text, state=snapshot(s))
+            atis_playing[1] = await sess.render(text, fac)
+            atis_playing[0] = key
+        if not sess.player.busy():
+            await asyncio.sleep(1.5)  # gap between repeats
+            if atis_playing[0] == key and not rec.recording and not sess.busy:
+                sess.player.start(*atis_playing[1])
+
+    async def atis_loop():
         while True:
             await asyncio.sleep(0.5)
-            if not (xp.connected and xp.values):
-                continue
-            s = AircraftState.from_values(xp.values)
-            fac = _atis_facility(sess.db, s)
-            if fac is None:
-                if playing_key:
-                    sess.player.stop()
-                    playing_key = None
-                continue
-            if rec.recording or sess.busy:
-                continue
-            text, letter = atis.build(fac, s)
-            key = (fac.key, letter)
-            if key != playing_key:
-                sess.player.stop()
-                log.info("ATIS %s: %s", fac.airport["id"], text)
-                sess.log.write("atis", airport=fac.airport["id"], letter=letter, text=text, state=snapshot(s))
-                audio = await sess.render(text, fac)
-                playing_key = key
-            if not sess.player.busy():
-                await asyncio.sleep(1.5)  # gap between repeats
-                if playing_key == key and not rec.recording and not sess.busy:
-                    sess.player.start(*audio)
+            try:
+                await atis_tick()
+            except Exception as e:  # noqa: BLE001 - one failed broadcast must not end ATIS for the session
+                log.warning("ATIS failed (%s); trying again shortly", e)
+                atis_playing[0] = None
+                await asyncio.sleep(5)
+
+    async def initiate(ev: str, s: AircraftState, since: float):
+        """A controller-initiated call; if it fails (network, model) it is tried again when quiet."""
+        try:
+            await sess.respond(ev, s, event=True)
+        except Exception as e:  # noqa: BLE001
+            log.error("ATC-initiated call failed (%s); will retry", e)
+            sess.deferred_event = (ev, since)
+            sess.quiet_until = time.monotonic() + 5.0
 
     from .chatter import Chatter
 
     chatter = Chatter(sess, cfg.chatter_mode, cfg.chatter_min_gap, cfg.chatter_max_gap)
 
     def is_idle(ignore_lock: bool = False) -> bool:
-        return not rec.recording and (ignore_lock or not sess.busy) and not pending
+        return not rec.recording and (ignore_lock or not sess.busy) and not pending and sess.quiet()
 
     xp.on_command(cfg.ptt_command, on_ptt)
     task = asyncio.create_task(xp.run())
@@ -449,7 +500,7 @@ async def cmd_run(cfg) -> None:
     log.info("Bind your yoke PTT button to the X-Plane command '%s'. Ctrl+C to quit.", cfg.ptt_command)
     try:
         while True:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             if xp.connected and xp.values:
                 s = AircraftState.from_values(xp.values)
                 fac = _facility(sess.db, s)
@@ -458,13 +509,26 @@ async def cmd_run(cfg) -> None:
                 if st != last_status[0]:
                     last_status[0] = st
                     log.info("Tuned: %s", st)
+                if s.paused:  # sim paused: nobody calls, and the timers don't run
+                    sess.ctl.shift_timers(1.0)
+                    sess.quiet_until += 1.0
+                    chatter.next_t += 1.0
+                    continue
                 if chatter.due(fac, busy=not is_idle()):
                     chatter.start(s, fac, is_idle)
-                if not rec.recording and not sess.busy and not pending:
-                    ev = sess.ctl.pending_event(s, fac)
+                if not rec.recording and not sess.busy and not pending and sess.quiet():
+                    ev = None
+                    since = time.monotonic()
+                    if sess.deferred_event:  # held back while the pilot talked, or it failed
+                        ev, since = sess.deferred_event
+                        sess.deferred_event = None
+                        if time.monotonic() - since > EVENT_MAX_DEFER_S:
+                            log.warning("(ATC-initiated call dropped, too old: %s)", ev.split(".")[0])
+                            ev, since = None, time.monotonic()
+                    ev = ev or sess.ctl.pending_event(s, fac)
                     if ev:
                         log.info("(ATC-initiated call: %s)", ev.split(".")[0])
-                        t = asyncio.create_task(sess.respond(ev, s, event=True))
+                        t = asyncio.create_task(initiate(ev, s, since))
                         pending.add(t)
                         t.add_done_callback(pending.discard)
     finally:
@@ -577,7 +641,7 @@ def cmd_devices() -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(prog="atc", description="AI ATC for X-Plane 12")
-    p.add_argument("-c", "--config", default="atc.toml")
+    p.add_argument("-c", "--config", help="configuration file (default: atc.toml)")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("monitor")
@@ -613,7 +677,12 @@ def main() -> None:
                         format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     for noisy in ("httpx", "httpcore", "websockets"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    cfg = config_mod.load(args.config)
+    if args.config:
+        from pathlib import Path
+
+        if not Path(args.config).is_file():
+            raise SystemExit(f"Config file not found: {args.config}")
+    cfg = config_mod.load(args.config or "atc.toml")
     try:
         if args.cmd == "monitor":
             asyncio.run(cmd_monitor(cfg))
@@ -635,8 +704,14 @@ def main() -> None:
         import httpx
 
         if isinstance(e, httpx.ConnectError):
-            raise SystemExit(f"Can't reach X-Plane at {cfg.xplane_host}:{cfg.xplane_port} "
-                             "(is it running with a flight loaded?)") from None
+            try:
+                host, port = e.request.url.host, e.request.url.port
+            except RuntimeError:  # no request attached to the error
+                host = port = None
+            if host is None or (host == cfg.xplane_host and port == cfg.xplane_port):
+                raise SystemExit(f"Can't reach X-Plane at {cfg.xplane_host}:{cfg.xplane_port} "
+                                 "(is it running with a flight loaded?)") from None
+            raise SystemExit(f"Can't reach {host} ({e}); check the internet connection") from None
         raise
 
 

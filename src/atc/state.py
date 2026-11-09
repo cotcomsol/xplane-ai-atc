@@ -18,7 +18,9 @@ def _f(v, default=0.0) -> float:
         return default
 
 
-XPDR_MODES = {0: "off", 1: "standby", 2: "on (mode A)", 3: "alt (mode C)", 4: "test", 5: "ground"}
+# sim/cockpit2/radios/actuators/transponder_mode; 6 and 7 are TCAS-equipped aircraft, which also report altitude
+XPDR_MODES = {0: "off", 1: "standby", 2: "on (mode A)", 3: "alt (mode C)", 4: "test", 5: "ground",
+              6: "TA only (mode S, alt)", 7: "TA/RA (mode S, alt)"}
 
 
 @dataclass
@@ -42,7 +44,7 @@ class AircraftState:
     altimeter_inhg: float | None
     wind_dir: float | None
     wind_kt: float | None
-    magvar: float = 0.0  # true - magnetic, degrees (east variation is negative here)
+    magvar: float = 0.0  # true - magnetic, degrees (east variation is positive)
     # Weather (None when X-Plane doesn't provide it)
     vis_sm: float | None = None
     temp_c: float | None = None  # at the aircraft
@@ -53,6 +55,7 @@ class AircraftState:
     traffic: list = None  # list[Target]
     rx_com1: bool = True  # audio panel receive switches
     rx_com2: bool = True
+    paused: bool = False
 
     @property
     def tx_khz(self) -> int:
@@ -102,6 +105,7 @@ class AircraftState:
             traffic=_traffic(v),
             rx_com1=bool(_f(v.get("rx_com1", 1), 1)),
             rx_com2=bool(_f(v.get("rx_com2", 1), 1)),
+            paused=bool(_f(v.get("paused"))),
         )
 
 

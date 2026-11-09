@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .airports import bearing, dist_nm
 from .phraseology import NUMBERS, type_name
+from .phraseology import altitude_words as alt_words
 
 COMPASS8 = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"]
 ONES = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"]
@@ -23,16 +24,6 @@ def direction(hdg_true: float | None) -> str:
     if hdg_true is None:
         return ""
     return COMPASS8[int(((hdg_true % 360) + 22.5) // 45) % 8] + "bound"
-
-
-def alt_words(ft: float) -> str:
-    th, hu = divmod(int(round(ft / 100.0) * 100), 1000)
-    parts = []
-    if th:
-        parts.append(f"{' '.join(NUMBERS[c] for c in str(th))} thousand")
-    if hu:
-        parts.append(f"{NUMBERS[str(hu // 100)]} hundred")
-    return " ".join(parts) or "zero"
 
 
 def describe_type(t) -> str:

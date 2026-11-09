@@ -95,7 +95,16 @@ def render_transcript(records: list[dict]) -> str:
 
 
 def load(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    """The log's records; a line cut short by a crash is skipped."""
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            rec = json.loads(line) if line.strip() else None
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and "kind" in rec:
+            out.append(rec)
+    return out
 
 
 async def run(api, model: str, path: Path) -> tuple[str, Path]:

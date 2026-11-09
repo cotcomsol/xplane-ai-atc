@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 
@@ -10,6 +11,7 @@ import httpx
 log = logging.getLogger(__name__)
 
 BASE = "https://openrouter.ai/api/v1"
+RETRY_STATUS = (429, 500, 502, 503, 504)  # rate limit / provider trouble: worth one more try
 
 
 class OpenRouter:
@@ -26,17 +28,36 @@ class OpenRouter:
     async def _post(self, path: str, body: dict, timeout: float = 60.0, retry_timeout: float | None = None
                     ) -> httpx.Response:
         """POST; when retry_timeout is set, a request slower than `timeout` is abandoned and sent again
-        (OpenRouter providers occasionally stall for 10-20 s)."""
-        try:
-            r = await self.http.post(path, json=body, timeout=timeout)
-        except httpx.TimeoutException:
-            if retry_timeout is None:
-                raise
-            log.warning("OpenRouter %s slow (> %.0fs), retrying", path, timeout)
-            r = await self.http.post(path, json=body, timeout=retry_timeout)
+        (OpenRouter providers occasionally stall for 10-20 s). A rate-limit or server error is retried once."""
+        for attempt in (1, 2):
+            try:
+                r = await self.http.post(path, json=body,
+                                         timeout=timeout if attempt == 1 else retry_timeout or timeout)
+            except httpx.TimeoutException:
+                if retry_timeout is None or attempt == 2:
+                    raise
+                log.warning("OpenRouter %s slow (> %.0fs), retrying", path, timeout)
+                continue
+            if r.status_code in RETRY_STATUS and attempt == 1:
+                log.warning("OpenRouter %s returned %d, retrying", path, r.status_code)
+                await asyncio.sleep(1.0)
+                continue
+            break
         if r.status_code != 200:
             raise RuntimeError(f"OpenRouter {path} {r.status_code}: {r.text[:300]}")
         return r
+
+    @staticmethod
+    def _json(r: httpx.Response, path: str) -> dict:
+        """The response body; OpenRouter also reports provider errors in a 200 response."""
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"OpenRouter {path}: not JSON: {r.text[:200]}") from None
+        err = data.get("error") if isinstance(data, dict) else "unexpected response"
+        if err:
+            raise RuntimeError(f"OpenRouter {path}: {err.get('message', err) if isinstance(err, dict) else err}")
+        return data
 
     async def transcribe(self, wav: bytes, model: str, prompt: str = "") -> str:
         body = {
@@ -47,7 +68,7 @@ class OpenRouter:
         if prompt:
             body["prompt"] = prompt  # vocabulary hint; honored by OpenAI transcribe models
         r = await self._post("/audio/transcriptions", body, timeout=8, retry_timeout=20)
-        data = r.json()
+        data = self._json(r, "/audio/transcriptions")
         self.cost += float((data.get("usage") or {}).get("cost") or 0)
         return (data.get("text") or "").strip()
 
@@ -59,8 +80,10 @@ class OpenRouter:
         elif reasoning_effort:
             body["reasoning"] = {"effort": reasoning_effort}
         r = await self._post("/chat/completions", body, timeout=timeout, retry_timeout=retry_timeout)
-        data = r.json()
+        data = self._json(r, "/chat/completions")
         self.cost += float((data.get("usage") or {}).get("cost") or 0)
+        if not data.get("choices"):
+            raise RuntimeError(f"OpenRouter /chat/completions: no reply in the response ({str(data)[:200]})")
         choice = data["choices"][0]
         self.last_finish = choice.get("finish_reason")
         content = (choice["message"].get("content") or "").strip()

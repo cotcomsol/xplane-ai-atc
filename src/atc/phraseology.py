@@ -86,6 +86,17 @@ def digits(n) -> str:
     return " ".join(NUMBERS.get(c, c) for c in str(n))
 
 
+def altitude_words(ft: float) -> str:
+    """4500 -> 'four thousand five hundred', 12000 -> 'one two thousand' (nearest hundred feet)."""
+    th, hu = divmod(int(round(ft / 100.0) * 100), 1000)
+    parts = []
+    if th:
+        parts.append(f"{digits(th)} thousand")
+    if hu:
+        parts.append(f"{digits(hu // 100)} hundred")
+    return " ".join(parts) or "zero"
+
+
 def spoken_runway(rwy: str) -> str:
     """'30L' -> 'three zero left'."""
     return " ".join(NUMBERS.get(c, {"L": "left", "R": "right", "C": "center"}.get(c, c)) for c in rwy)

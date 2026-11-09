@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .airports import bearing, dist_nm
 from .phraseology import NUMBERS, spoken_runway
+from .phraseology import altitude_words as _alt_words
 
 CIFP_DIRS = ["Custom Data/CIFP", "Resources/default data/CIFP"]
 
@@ -90,6 +91,11 @@ class Procedures:
     thresholds: dict[str, Threshold]
     approaches: dict[str, Approach]
     sids: dict[str, Sid] = field(default_factory=dict)
+
+    def for_runway_all(self) -> list[Approach]:
+        """Every approach, in the same preference order as for_runway."""
+        order = {"ILS": 0, "LOC": 1, "RNAV (GPS)": 2, "RNAV (RNP)": 3, "GPS": 4}
+        return sorted(self.approaches.values(), key=lambda a: (order.get(a.kind, 9), a.variant, a.runway))
 
     def for_runway(self, runway: str) -> list[Approach]:
         order = {"ILS": 0, "LOC": 1, "RNAV (GPS)": 2, "RNAV (RNP)": 3, "GPS": 4}
@@ -218,16 +224,6 @@ def _miles_words(n: int) -> str:
     return f"{' '.join(NUMBERS[c] for c in str(n))} mile{'s' if n != 1 else ''}"
 
 
-def _alt_words(ft: int) -> str:
-    th, hu = divmod(int(round(ft / 100.0) * 100), 1000)
-    out = []
-    if th:
-        out.append(f"{_digits(th)} thousand")
-    if hu:
-        out.append(f"{_digits(hu // 100)} hundred")
-    return " ".join(out) or "zero"
-
-
 def vectors(ap: Approach, thr: Threshold, lat: float, lon: float, magvar: float,
             cur_hdg: float | None = None, cur_alt: float | None = None) -> str:
     return vector_plan(ap, thr, lat, lon, magvar, cur_hdg, cur_alt)[2]
@@ -258,8 +254,8 @@ def turn_words(cur_hdg: float | None, target: float) -> str:
 
 def vector_plan(ap: Approach, thr: Threshold, lat: float, lon: float, magvar: float,
                 cur_hdg: float | None = None, cur_alt: float | None = None) -> tuple[bool, float, str]:
-    """(in position to clear, magnetic heading to assign, controller instruction text)."""
-    """What a radar controller would say now to get this aircraft onto the approach.
+    """(in position to clear, magnetic heading to assign, controller instruction text): what a radar
+    controller would say now to get this aircraft onto the approach.
     magvar = true - magnetic (as in AircraftState)."""
     crs_true = (ap.course_mag + magvar) % 360
     out_true = (crs_true + 180) % 360

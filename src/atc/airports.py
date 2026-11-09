@@ -53,6 +53,11 @@ class Facility:
 
     @property
     def key(self) -> str:
+        """Identifies the controller being talked to (conversation history, voice, handoffs)."""
+        if self.kind in ("APPROACH", "DEPARTURE"):
+            # One radar controller per frequency: every airport in its area lists that frequency (as
+            # approach, departure or both), and which of them is nearest changes as the aircraft flies.
+            return f"RADAR:{int(round(self.khz / 25.0)) * 25}"
         return f"{self.airport['id']}:{self.kind}:{self.khz}"
 
 

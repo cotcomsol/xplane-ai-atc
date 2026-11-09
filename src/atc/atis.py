@@ -7,7 +7,7 @@ import zlib
 
 from .airports import Facility
 from .controller import runway_in_use
-from .phraseology import ALPHABET, NUMBERS, region_for
+from .phraseology import ALPHABET, NUMBERS, altitude_words, region_for  # noqa: F401 - altitude_words re-exported
 
 LETTERS = list(ALPHABET.values())
 
@@ -15,18 +15,6 @@ LETTERS = list(ALPHABET.values())
 def digits(n: int | str) -> str:
     """1013 -> 'one zero one three' (aviation style)."""
     return " ".join(NUMBERS.get(c, c) for c in str(n))
-
-
-def altitude_words(ft: int) -> str:
-    """4500 -> 'four thousand five hundred', 12000 -> 'one two thousand'."""
-    ft = int(round(ft / 100.0) * 100)
-    th, hu = divmod(ft, 1000)
-    parts = []
-    if th:
-        parts.append(f"{digits(th)} thousand")
-    if hu:
-        parts.append(f"{digits(hu // 100)} hundred")
-    return " ".join(parts) or "zero"
 
 
 def zulu_hour_min(zulu_sec: float | None) -> tuple[int, int]:
@@ -38,8 +26,10 @@ def zulu_hour_min(zulu_sec: float | None) -> tuple[int, int]:
 
 
 def info_letter(airport_id: str, zulu_sec: float | None, runway: str | None) -> str:
-    """Changes every hour, and when the runway in use changes."""
-    hour, _ = zulu_hour_min(zulu_sec)
+    """Changes every hour (at 53 past, with the new observation), and when the runway in use changes."""
+    hour, minute = zulu_hour_min(zulu_sec)
+    if minute >= 53:
+        hour += 1
     return LETTERS[(hour + zlib.crc32(f"{airport_id}{runway}".encode())) % 26]
 
 

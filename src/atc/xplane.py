@@ -28,14 +28,11 @@ DATAREFS: dict[str, str | list[str]] = {
     "ias_kt": "sim/flightmodel/position/indicated_airspeed",
     "hdg_mag": "sim/flightmodel/position/mag_psi",
     "hdg_true": "sim/flightmodel/position/psi",
-    "track_true": "sim/flightmodel/position/hpath",
     "vs_fpm": "sim/flightmodel/position/vh_ind_fpm",
     "on_ground": "sim/flightmodel/failures/onground_any",
     "baro_alt_ft": "sim/cockpit2/gauges/indicators/altitude_ft_pilot",
     "com1_khz": "sim/cockpit2/radios/actuators/com1_frequency_hz_833",
     "com2_khz": "sim/cockpit2/radios/actuators/com2_frequency_hz_833",
-    "com1_stby_khz": "sim/cockpit2/radios/actuators/com1_standby_frequency_hz_833",
-    "com2_stby_khz": "sim/cockpit2/radios/actuators/com2_standby_frequency_hz_833",
     "mic_sel": "sim/cockpit2/radios/actuators/audio_com_selection_man",
     "mic_sel_auto": "sim/cockpit2/radios/actuators/audio_com_selection",
     "rx_com1": "sim/cockpit2/radios/actuators/audio_selection_com1",
@@ -44,7 +41,6 @@ DATAREFS: dict[str, str | list[str]] = {
     "xpdr_mode": "sim/cockpit2/radios/actuators/transponder_mode",
     "tailnum": "sim/aircraft/view/acf_tailnum",
     "icao_type": "sim/aircraft/view/acf_ICAO",
-    "baro_setting": "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot",
     # QNH as reported by stations (XP12), falling back to sea-level pressure
     "sl_press_pa": ["sim/weather/aircraft/qnh_pas", "sim/weather/region/qnh_pas",
                     "sim/weather/region/sealevel_pressure_pas"],
@@ -84,6 +80,12 @@ DATAREFS: dict[str, str | list[str]] = {
 RAW_DATA_KEYS = {"tcas_type"}
 
 
+def _vnum(version: str) -> int:
+    """'v2' -> 2 (so that v10 sorts after v9)."""
+    digits = "".join(c for c in str(version) if c.isdigit())
+    return int(digits) if digits else 0
+
+
 class XPlane:
     def __init__(self, host: str = "localhost", port: int = 8086):
         self.base = f"http://{host}:{port}/api"
@@ -95,6 +97,7 @@ class XPlane:
         self._cmd_ids: dict[int, str] = {}
         self._cmd_cbs: dict[str, list[Callable[[bool], None]]] = {}
         self._req = 0
+        self._active: set[str] = set()  # commands currently held down
         self.missing: list[str] = []
 
     def on_command(self, command: str, cb: Callable[[bool], None]) -> None:
@@ -105,7 +108,7 @@ class XPlane:
         try:
             r = await http.get(f"{self.base}/capabilities")
             versions = r.json()["api"]["versions"]
-            self.version = sorted(versions)[-1]
+            self.version = max(versions, key=_vnum)
             xp = r.json().get("x-plane", {}).get("version")
             log.info("X-Plane %s, web API %s", xp, self.version)
         except Exception:
@@ -133,7 +136,7 @@ class XPlane:
                         break
                 else:
                     self.missing.append(key)
-            if self.version >= "v2":
+            if _vnum(self.version) >= 2:
                 for cmd in self._cmd_cbs:
                     c = await self._lookup(http, "commands", cmd)
                     if c:
@@ -191,8 +194,18 @@ class XPlane:
                 else:
                     log.info("Waiting for X-Plane at %s (%s)", self.base, e)
             self.connected = False
+            for cmd in list(self._active):  # e.g. PTT held when the connection dropped: it won't be released
+                self._fire(cmd, False)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 15)
+
+    def _fire(self, cmd: str, active: bool) -> None:
+        (self._active.add if active else self._active.discard)(cmd)
+        for cb in self._cmd_cbs.get(cmd, []):
+            try:
+                cb(active)
+            except Exception:  # noqa: BLE001 - a failing callback must not drop the connection
+                log.exception("Handler for X-Plane command %s failed", cmd)
 
     def _handle(self, m: dict) -> None:
         t = m.get("type")
@@ -204,8 +217,8 @@ class XPlane:
         elif t == "command_update_is_active":
             for sid, active in m["data"].items():
                 cmd = self._cmd_ids.get(int(sid.strip()))
-                for cb in self._cmd_cbs.get(cmd, []):
-                    cb(bool(active))
+                if cmd:
+                    self._fire(cmd, bool(active))
         elif t == "result" and not m.get("success", True):
             log.error("X-Plane request %s failed: %s %s", m.get("req_id"),
                       m.get("error_code"), m.get("error_message"))

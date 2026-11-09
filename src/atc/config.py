@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -66,6 +67,30 @@ def _read_dotenv(path: Path) -> dict[str, str]:
     return out
 
 
+log = logging.getLogger(__name__)
+
+
+def _bool(v, default: bool) -> bool:
+    """true/false as a TOML boolean, or the same written as a string ("false", "off", "0")."""
+    if isinstance(v, str):
+        low = v.strip().lower()
+        if low in ("true", "yes", "on", "1"):
+            return True
+        if low in ("false", "no", "off", "0", ""):
+            return False
+        log.warning("Config: %r is not true or false; using %s", v, str(default).lower())
+        return default
+    return default if v is None else bool(v)
+
+
+def _choice(name: str, v, allowed: tuple[str, ...], default: str) -> str:
+    low = str(v).strip().lower()
+    if low not in allowed:
+        log.warning("Config: %s = %r is not one of %s; using %r", name, v, ", ".join(allowed), default)
+        return default
+    return low
+
+
 def _device(v):
     if v in ("", None):
         return None
@@ -103,16 +128,19 @@ def load(path: str | Path = "atc.toml") -> Config:
     au = data.get("audio", {})
     cfg.input_device = _device(au.get("input_device"))
     cfg.output_device = _device(au.get("output_device"))
-    cfg.radio_effect = bool(au.get("radio_effect", True))
-    cfg.stream_voice = bool(au.get("stream_voice", True))
-    cfg.voice_engine = str(au.get("voice_engine", cfg.voice_engine)).lower()
+    cfg.radio_effect = _bool(au.get("radio_effect"), True)
+    cfg.stream_voice = _bool(au.get("stream_voice"), True)
+    cfg.voice_engine = _choice("[audio] voice_engine", au.get("voice_engine", cfg.voice_engine),
+                               ("local", "openrouter"), cfg.voice_engine)
     cfg.voice_threads = int(au.get("voice_threads", cfg.voice_threads))
-    cfg.stt_engine = str(au.get("stt_engine", cfg.stt_engine)).lower()
+    cfg.stt_engine = _choice("[audio] stt_engine", au.get("stt_engine", cfg.stt_engine),
+                             ("openrouter", "local"), cfg.stt_engine)
     cfg.stt_threads = int(au.get("stt_threads", cfg.stt_threads))
-    cfg.save_recordings = bool(au.get("save_recordings", cfg.save_recordings))
+    cfg.save_recordings = _bool(au.get("save_recordings"), cfg.save_recordings)
 
     ch = data.get("chatter", {})
-    cfg.chatter_mode = ch.get("mode", cfg.chatter_mode)
+    cfg.chatter_mode = _choice("[chatter] mode", ch.get("mode", cfg.chatter_mode),
+                               ("always", "traffic", "off"), cfg.chatter_mode)
     cfg.chatter_min_gap = float(ch.get("min_gap", cfg.chatter_min_gap))
     cfg.chatter_max_gap = float(ch.get("max_gap", cfg.chatter_max_gap))
 
